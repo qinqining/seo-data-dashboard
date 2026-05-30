@@ -10,31 +10,124 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from dotenv import load_dotenv
 
 try:
-    from google.auth.transport.requests import Request
+    from google.auth.transport.requests import AuthorizedSession, Request
     from google.oauth2 import service_account
     from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
     from google_auth_oauthlib.flow import InstalledAppFlow
 except ImportError:
+    AuthorizedSession = None
     Request = None
     service_account = None
     Credentials = None
-    build = None
     InstalledAppFlow = None
 
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
+REPORT_DIR = ROOT / "reports"
 LOG_DIR.mkdir(exist_ok=True)
+REPORT_DIR.mkdir(exist_ok=True)
+
+TABLE_LABELS = {
+    "dashboard": "SEO自动数据看板",
+    "keywords": "核心关键词总库",
+    "pages": "页面全生命周期管理表",
+    "backlinks": "外链建设管控表",
+}
+
+
+@dataclass
+class SyncReport:
+    started_at: dt.datetime
+    data_date: dt.date
+    config: Config
+    api_calls: list[str] = None  # type: ignore[assignment]
+    writes: list[str] = None  # type: ignore[assignment]
+    skips: list[str] = None  # type: ignore[assignment]
+    warnings: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.api_calls = []
+        self.writes = []
+        self.skips = []
+        self.warnings = []
+
+    def log_api(
+        self,
+        provider: str,
+        endpoint: str,
+        *,
+        ok: bool = True,
+        detail: str = "",
+    ) -> None:
+        status = "OK" if ok else "FAIL"
+        message = f"[API][{status}] {provider} {endpoint}"
+        if detail:
+            message += f" | {detail}"
+        self.api_calls.append(message)
+        logging.info(message)
+
+    def log_write(self, table: str, action: str, key: Any, fields: dict[str, Any]) -> None:
+        rendered = format_fields_for_report(fields)
+        message = f"[WRITE] {table} {action} key={key} fields={rendered}"
+        self.writes.append(message)
+        logging.info(message)
+
+    def log_skip(self, table: str, reason: str) -> None:
+        message = f"[SKIP] {table} | {reason}"
+        self.skips.append(message)
+        logging.info(message)
+
+    def log_warning(self, message: str) -> None:
+        self.warnings.append(message)
+        logging.warning(message)
+
+    def save(self) -> Path:
+        finished_at = dt.datetime.now()
+        report_path = REPORT_DIR / f"sync-report-{self.started_at.strftime('%Y%m%d-%H%M%S')}.txt"
+        lines = [
+            "SEO Feishu Sync Report",
+            "=" * 60,
+            f"Started : {self.started_at.isoformat(sep=' ', timespec='seconds')}",
+            f"Finished: {finished_at.isoformat(sep=' ', timespec='seconds')}",
+            f"Data date: {self.data_date.isoformat()} (today - DATA_DELAY_DAYS={self.config.data_delay_days})",
+            f"GSC site : {self.config.gsc_site_url}",
+            f"Ahrefs   : {self.config.ahrefs_target_domain}",
+            "",
+            f"API calls ({len(self.api_calls)})",
+            "-" * 60,
+        ]
+        lines.extend(self.api_calls or ["(none)"])
+        lines.extend(["", f"Feishu writes ({len(self.writes)})", "-" * 60])
+        lines.extend(self.writes or ["(none)"])
+        lines.extend(["", f"Skipped ({len(self.skips)})", "-" * 60])
+        lines.extend(self.skips or ["(none)"])
+        if self.warnings:
+            lines.extend(["", f"Warnings ({len(self.warnings)})", "-" * 60])
+            lines.extend(self.warnings)
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logging.info("Sync report saved: %s", report_path)
+        return report_path
+
+
+def format_fields_for_report(fields: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, value in fields.items():
+        if isinstance(value, dt.date):
+            parts.append(f"{key}={value.isoformat()}")
+        else:
+            parts.append(f"{key}={value!r}")
+    return "{" + ", ".join(parts) + "}"
 
 
 def setup_logging() -> None:
@@ -91,6 +184,53 @@ class Config:
         )
 
 
+FEISHU_DATE_FIELDS = {"日期"}
+
+
+def get_target_date(config: Config) -> dt.date:
+    return dt.date.today() - dt.timedelta(days=config.data_delay_days)
+
+
+def feishu_date_ms(value: dt.date | dt.datetime | str) -> int:
+    if isinstance(value, str):
+        date_value = dt.date.fromisoformat(value)
+    elif isinstance(value, dt.datetime):
+        date_value = value.date()
+    else:
+        date_value = value
+    midnight_utc = dt.datetime.combine(date_value, dt.time.min, tzinfo=dt.timezone.utc)
+    return int(midnight_utc.timestamp() * 1000)
+
+
+def normalize_feishu_write_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in FEISHU_DATE_FIELDS and value is not None:
+            normalized[key] = feishu_date_ms(value)
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def feishu_field_equals(field_name: str, stored: Any, expected: Any) -> bool:
+    if stored == expected:
+        return True
+    if field_name not in FEISHU_DATE_FIELDS or expected is None:
+        return False
+    try:
+        expected_ms = feishu_date_ms(expected)
+    except ValueError:
+        return False
+    if isinstance(stored, (int, float)):
+        return int(stored) == expected_ms
+    if isinstance(stored, str):
+        try:
+            return feishu_date_ms(stored) == expected_ms
+        except ValueError:
+            return False
+    return False
+
+
 def env_required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -99,8 +239,9 @@ def env_required(name: str) -> str:
 
 
 class FeishuClient:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, report: SyncReport | None = None):
         self.config = config
+        self.report = report
         self.base_url = "https://open.feishu.cn/open-apis"
         self.session = requests.Session()
         self.tenant_access_token = self.get_tenant_access_token()
@@ -125,6 +266,8 @@ class FeishuClient:
         payload = resp.json()
         if payload.get("code") != 0:
             raise RuntimeError(f"Failed to get Feishu token: {payload}")
+        if self.report:
+            self.report.log_api("Feishu", "auth/v3/tenant_access_token/internal", detail="token acquired")
         return payload["tenant_access_token"]
 
     def list_records(self, table_id: str, page_size: int = 100) -> list[dict[str, Any]]:
@@ -145,33 +288,71 @@ class FeishuClient:
                 return records
             page_token = data.get("page_token", "")
 
-    def create_record(self, table_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def upsert_record(
+        self,
+        table_id: str,
+        key_field: str,
+        key_value: Any,
+        fields: dict[str, Any],
+        *,
+        table_label: str = "",
+    ) -> None:
+        existing = self.find_record_by_field(table_id, key_field, key_value)
+        label = table_label or table_id
+        if existing:
+            self.update_record(
+                table_id,
+                existing["record_id"],
+                fields,
+                table_label=label,
+                action="update",
+                key_value=key_value,
+            )
+        else:
+            self.create_record(table_id, fields, table_label=label, action="create", key_value=key_value)
+
+    def create_record(
+        self,
+        table_id: str,
+        fields: dict[str, Any],
+        *,
+        table_label: str = "",
+        action: str = "create",
+        key_value: Any = "",
+    ) -> dict[str, Any]:
         url = (
             f"{self.base_url}/bitable/v1/apps/"
             f"{self.config.feishu_base_app_token}/tables/{table_id}/records"
         )
-        return self._request("POST", url, json={"fields": fields})
+        payload = self._request("POST", url, json={"fields": normalize_feishu_write_fields(fields)})
+        if self.report:
+            self.report.log_write(table_label or table_id, action, key_value, fields)
+        return payload
 
-    def update_record(self, table_id: str, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update_record(
+        self,
+        table_id: str,
+        record_id: str,
+        fields: dict[str, Any],
+        *,
+        table_label: str = "",
+        action: str = "update",
+        key_value: Any = "",
+    ) -> dict[str, Any]:
         url = (
             f"{self.base_url}/bitable/v1/apps/"
             f"{self.config.feishu_base_app_token}/tables/{table_id}/records/{record_id}"
         )
-        return self._request("PUT", url, json={"fields": fields})
-
-    def upsert_record(self, table_id: str, key_field: str, key_value: Any, fields: dict[str, Any]) -> None:
-        existing = self.find_record_by_field(table_id, key_field, key_value)
-        if existing:
-            self.update_record(table_id, existing["record_id"], fields)
-            logging.info("Updated Feishu record table=%s key=%s", table_id, key_value)
-        else:
-            self.create_record(table_id, fields)
-            logging.info("Created Feishu record table=%s key=%s", table_id, key_value)
+        payload = self._request("PUT", url, json={"fields": normalize_feishu_write_fields(fields)})
+        if self.report:
+            self.report.log_write(table_label or table_id, action, key_value or record_id, fields)
+        return payload
 
     def find_record_by_field(self, table_id: str, key_field: str, key_value: Any) -> dict[str, Any] | None:
         for record in self.list_records(table_id):
             fields = record.get("fields", {})
-            if fields.get(key_field) == key_value:
+            stored = fields.get(key_field)
+            if feishu_field_equals(key_field, stored, key_value) or stored == key_value:
                 return record
         return None
 
@@ -186,23 +367,27 @@ class FeishuClient:
 
 class GSCClient:
     SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+    API_BASE = "https://searchconsole.googleapis.com/webmasters/v3"
+    INSPECTION_URL = "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect"
+    REQUEST_TIMEOUT = 60
+    MAX_RETRIES = 3
 
-    def __init__(self, config: Config):
-        self.config = config
-        self.service = self._build_service()
-
-    def _build_service(self) -> Any:
-        if build is None:
+    def __init__(self, config: Config, report: SyncReport | None = None):
+        if AuthorizedSession is None or Request is None:
             raise RuntimeError("Google API dependencies are not installed.")
 
-        if self.config.google_auth_mode == "service_account":
-            credentials = self._load_service_account_credentials()
-        elif self.config.google_auth_mode == "oauth":
-            credentials = self._load_oauth_credentials()
-        else:
-            raise RuntimeError(f"Unsupported GOOGLE_AUTH_MODE: {self.config.google_auth_mode}")
+        self.config = config
+        self.report = report
+        self.site_url = config.gsc_site_url
+        credentials = self._load_credentials()
+        self.session = AuthorizedSession(credentials)
 
-        return build("searchconsole", "v1", credentials=credentials)
+    def _load_credentials(self) -> Any:
+        if self.config.google_auth_mode == "service_account":
+            return self._load_service_account_credentials()
+        if self.config.google_auth_mode == "oauth":
+            return self._load_oauth_credentials()
+        raise RuntimeError(f"Unsupported GOOGLE_AUTH_MODE: {self.config.google_auth_mode}")
 
     def _load_service_account_credentials(self) -> Any:
         if service_account is None:
@@ -249,26 +434,54 @@ class GSCClient:
             "dimensions": ["date"],
             "rowLimit": 1,
         }
-        result = (
-            self.service.searchanalytics()
-            .query(siteUrl=self.config.gsc_site_url, body=body)
-            .execute()
-        )
+        result = self._query_search_analytics(body, label="query_site_summary")
         rows = result.get("rows", [])
         if not rows:
-            return {
+            summary = {
                 "clicks": 0,
                 "impressions": 0,
                 "ctr": 0,
                 "position": 0,
             }
-        row = rows[0]
-        return {
-            "clicks": row.get("clicks", 0),
-            "impressions": row.get("impressions", 0),
-            "ctr": row.get("ctr", 0),
-            "position": row.get("position", 0),
+        else:
+            row = rows[0]
+            summary = {
+                "clicks": row.get("clicks", 0),
+                "impressions": row.get("impressions", 0),
+                "ctr": row.get("ctr", 0),
+                "position": row.get("position", 0),
+            }
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                "searchAnalytics/query (site summary)",
+                detail=(
+                    f"date={date_value.isoformat()} clicks={summary['clicks']} "
+                    f"impressions={summary['impressions']} ctr={summary['ctr']} "
+                    f"position={summary['position']}"
+                ),
+            )
+        return summary
+
+    def query_clicks_sum(self, start_date: dt.date, end_date: dt.date) -> int:
+        body = {
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "rowLimit": 1,
         }
+        result = self._query_search_analytics(
+            body,
+            label=f"query_clicks_sum {start_date.isoformat()}..{end_date.isoformat()}",
+        )
+        rows = result.get("rows", [])
+        clicks = int(rows[0].get("clicks", 0)) if rows else 0
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                "searchAnalytics/query (clicks sum)",
+                detail=f"range={start_date.isoformat()}..{end_date.isoformat()} clicks={clicks}",
+            )
+        return clicks
 
     def query_page_clicks(self, date_value: dt.date, page_url: str) -> int:
         body = {
@@ -288,20 +501,144 @@ class GSCClient:
             ],
             "rowLimit": 1,
         }
-        result = (
-            self.service.searchanalytics()
-            .query(siteUrl=self.config.gsc_site_url, body=body)
-            .execute()
-        )
+        result = self._query_search_analytics(body, label=f"query_page_clicks {page_url}")
         rows = result.get("rows", [])
-        return int(rows[0].get("clicks", 0)) if rows else 0
+        clicks = int(rows[0].get("clicks", 0)) if rows else 0
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                "searchAnalytics/query (page clicks)",
+                detail=f"date={date_value.isoformat()} page={page_url} clicks={clicks}",
+            )
+        return clicks
+
+    def inspect_page_index_status(self, page_url: str) -> str | None:
+        if not page_url_belongs_to_property(page_url, self.site_url):
+            message = (
+                f"页面 URL 不在 GSC 资源范围内: {page_url} "
+                f"(当前 GSC_SITE_URL={self.site_url})"
+            )
+            if self.report:
+                self.report.log_warning(message)
+            return None
+
+        body = {
+            "inspectionUrl": page_url,
+            "siteUrl": self.site_url,
+        }
+        last_error: Exception | None = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                response = self.session.post(
+                    self.INSPECTION_URL,
+                    json=body,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+                if response.status_code == 403:
+                    message = self._extract_error_message(response)
+                    if self._is_url_property_mismatch(message):
+                        if self.report:
+                            self.report.log_warning(
+                                f"URL Inspection 403: {page_url} | {message} | "
+                                f"请确认页面 URL 与 GSC_SITE_URL={self.site_url} 完全一致"
+                            )
+                        return None
+                    self._raise_gsc_permission_error(response)
+                response.raise_for_status()
+                payload = response.json()
+                index_result = payload.get("inspectionResult", {}).get("indexStatusResult", {})
+                status = map_gsc_index_status(
+                    index_result.get("coverageState", ""),
+                    index_result.get("verdict", ""),
+                )
+                if self.report:
+                    self.report.log_api(
+                        "GSC",
+                        "urlInspection/index:inspect",
+                        detail=f"page={page_url} status={status} coverage={index_result.get('coverageState', '')}",
+                    )
+                return status
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                logging.warning(
+                    "GSC URL inspection failed (attempt %s/%s): %s",
+                    attempt,
+                    self.MAX_RETRIES,
+                    exc,
+                )
+                if attempt < self.MAX_RETRIES:
+                    time.sleep(2)
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                "urlInspection/index:inspect",
+                ok=False,
+                detail=f"page={page_url} error={last_error}",
+            )
+        return None
+
+    @staticmethod
+    def _extract_error_message(response: requests.Response) -> str:
+        try:
+            payload = response.json()
+            return payload.get("error", {}).get("message", response.text)
+        except ValueError:
+            return response.text
+
+    @staticmethod
+    def _is_url_property_mismatch(message: str) -> bool:
+        lowered = message.lower()
+        return (
+            "do not own this site" in lowered
+            or "not part of this property" in lowered
+            or "inspected url" in lowered
+        )
+
+    def _query_search_analytics(self, body: dict[str, Any], label: str = "searchAnalytics/query") -> dict[str, Any]:
+        encoded_site = quote(self.site_url, safe="")
+        url = f"{self.API_BASE}/sites/{encoded_site}/searchAnalytics/query"
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                response = self.session.post(url, json=body, timeout=self.REQUEST_TIMEOUT)
+                if response.status_code == 403:
+                    self._raise_gsc_permission_error(response)
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                logging.warning("GSC request failed (attempt %s/%s): %s", attempt, self.MAX_RETRIES, exc)
+                if attempt < self.MAX_RETRIES:
+                    time.sleep(2)
+
+        raise RuntimeError(
+            "无法连接 Google Search Console API。请检查网络/VPN/代理，或在 .env 中设置 "
+            "HTTPS_PROXY 后重试。"
+        ) from last_error
+
+    def _raise_gsc_permission_error(self, response: requests.Response) -> None:
+        message = self._extract_error_message(response)
+        if "has not been used" in message or "is disabled" in message:
+            raise RuntimeError(
+                "Google Search Console API 未启用。请打开 Google Cloud Console，"
+                "在创建 OAuth 客户端的同一项目中启用 Search Console API，然后等待 1-2 分钟再重试。"
+            ) from None
+
+        raise RuntimeError(
+            "Google Search Console 返回 403。"
+            "请确认：1) 已在 Cloud Console 启用 Search Console API；"
+            "2) 授权账号对该站点有权限；"
+            f"3) GSC_SITE_URL 与 Search Console 中的站点地址完全一致。详情: {message}"
+        ) from None
 
 
 class AhrefsClient:
     BASE_URL = "https://api.ahrefs.com/v3"
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, report: SyncReport | None = None):
         self.config = config
+        self.report = report
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -309,7 +646,7 @@ class AhrefsClient:
                 "Accept": "application/json",
             }
         )
-        self.report_date = dt.date.today() - dt.timedelta(days=config.data_delay_days)
+        self.report_date = get_target_date(config)
         self.compare_date = self.report_date - dt.timedelta(days=7)
         self._organic_rankings: dict[str, dict[str, Any]] | None = None
         self._overview_cache: dict[str, dict[str, Any]] = {}
@@ -336,6 +673,12 @@ class AhrefsClient:
                 rankings[str(keyword).casefold()] = item
         self._organic_rankings = rankings
         logging.info("Loaded %s organic keywords from Ahrefs", len(rankings))
+        if self.report:
+            self.report.log_api(
+                "Ahrefs",
+                "site-explorer/organic-keywords",
+                detail=f"date={self.report_date.isoformat()} count={len(rankings)}",
+            )
         return rankings
 
     def preload_keyword_overview(self, keywords: list[str]) -> None:
@@ -409,6 +752,12 @@ class AhrefsClient:
         )
         rating = payload.get("domain_rating", {})
         is_indexed = self._is_backlink_live(target)
+        if self.report:
+            self.report.log_api(
+                "Ahrefs",
+                "site-explorer/domain-rating",
+                detail=f"domain={target} dr={rating.get('domain_rating')} indexed={is_indexed}",
+            )
         return {
             "dr": rating.get("domain_rating"),
             "is_indexed": is_indexed,
@@ -418,23 +767,38 @@ class AhrefsClient:
         rankings = self.load_organic_rankings()
         top10_count = 0
         top30_count = 0
+        previous_top30_count = 0
         for keyword in tracked_keywords:
             ranking = rankings.get(keyword.casefold())
             if not ranking:
                 continue
             position = ranking.get("best_position")
-            if position is None:
-                continue
-            if position <= 10:
+            previous_position = ranking.get("best_position_prev")
+            if position is not None and position <= 10:
                 top10_count += 1
-            if position <= 30:
+            if position is not None and position <= 30:
                 top30_count += 1
+            if previous_position is not None and previous_position <= 30:
+                previous_top30_count += 1
 
-        return {
+        new_rd = self._get_refdomains_delta()
+        top30_change = calc_ratio_change(top30_count, previous_top30_count)
+        summary = {
             "top10_count": top10_count,
             "top30_count": top30_count,
-            "new_referring_domains": self._get_refdomains_delta(),
+            "new_referring_domains": new_rd,
+            "top30_week_change": top30_change,
         }
+        if self.report:
+            self.report.log_api(
+                "Ahrefs",
+                "dashboard summary",
+                detail=(
+                    f"top10={top10_count} top30={top30_count} new_rd={new_rd} "
+                    f"top30_week_change={top30_change}"
+                ),
+            )
+        return summary
 
     def _get_refdomains_delta(self) -> int | None:
         start_date = self.report_date - dt.timedelta(days=7)
@@ -449,8 +813,16 @@ class AhrefsClient:
         )
         points = payload.get("refdomains", [])
         if len(points) < 2:
-            return None
-        return int(points[-1]["refdomains"]) - int(points[0]["refdomains"])
+            delta = None
+        else:
+            delta = int(points[-1]["refdomains"]) - int(points[0]["refdomains"])
+        if self.report:
+            self.report.log_api(
+                "Ahrefs",
+                "site-explorer/refdomains-history",
+                detail=f"range={start_date.isoformat()}..{self.report_date.isoformat()} delta={delta}",
+            )
+        return delta
 
     def _is_backlink_live(self, referring_domain: str) -> bool | None:
         where = json.dumps(
@@ -479,8 +851,261 @@ class AhrefsClient:
         resp.raise_for_status()
         payload = resp.json()
         if "error" in payload:
+            if self.report:
+                self.report.log_api("Ahrefs", path, ok=False, detail=str(payload["error"]))
             raise RuntimeError(f"Ahrefs API error ({path}): {payload['error']}")
         return payload
+
+
+def calc_ratio_change(current: int, previous: int) -> float | None:
+    if previous <= 0:
+        return None
+    return (current - previous) / previous
+
+
+def map_gsc_index_status(coverage_state: str, verdict: str) -> str:
+    state = (coverage_state or "").lower()
+    if verdict == "PASS" or "submitted and indexed" in state:
+        return "已收录"
+    if verdict == "FAIL" or "not indexed" in state:
+        return "未收录"
+    return "索引异常"
+
+
+def build_dashboard_alert(
+    gsc_summary: dict[str, Any],
+    page_stats: dict[str, int],
+    traffic_week_change: float | None,
+) -> str:
+    alerts: list[str] = []
+    if traffic_week_change is not None and traffic_week_change <= -0.2:
+        alerts.append("流量下跌")
+    if page_stats.get("updated", 0) > 0 and page_stats.get("crawl_issues", 0) > 0:
+        alerts.append("收录异常")
+    return alerts[0] if alerts else "正常"
+
+
+def sync_dashboard(
+    config: Config,
+    feishu: FeishuClient,
+    gsc: GSCClient,
+    ahrefs: AhrefsClient,
+    tracked_keywords: list[str],
+    page_stats: dict[str, int],
+    report: SyncReport,
+) -> None:
+    data_date = get_target_date(config)
+    gsc_summary = gsc.query_site_summary(data_date)
+    ahrefs_summary = ahrefs.get_dashboard_summary(tracked_keywords)
+
+    this_week_start = data_date - dt.timedelta(days=6)
+    last_week_end = data_date - dt.timedelta(days=7)
+    last_week_start = data_date - dt.timedelta(days=13)
+    this_week_clicks = gsc.query_clicks_sum(this_week_start, data_date)
+    last_week_clicks = gsc.query_clicks_sum(last_week_start, last_week_end)
+    traffic_week_change = calc_ratio_change(this_week_clicks, last_week_clicks)
+
+    fields: dict[str, Any] = {
+        "日期": data_date,
+        "自然点击（GSC）": gsc_summary["clicks"],
+        "展示量（GSC）": gsc_summary["impressions"],
+        "平均CTR": gsc_summary["ctr"],
+        "全站平均排名": gsc_summary["position"],
+        "核心词Top10数量": ahrefs_summary["top10_count"],
+        "核心词Top30数量": ahrefs_summary["top30_count"],
+        "今日新增RD（referring domain）": ahrefs_summary["new_referring_domains"],
+        "网站总收录页面": page_stats.get("indexed_pages", 0),
+        "抓取异常数量": page_stats.get("crawl_issues", 0),
+        "异常预警": build_dashboard_alert(gsc_summary, page_stats, traffic_week_change),
+    }
+    if traffic_week_change is not None:
+        fields["周环比流量"] = traffic_week_change
+    if ahrefs_summary["top30_week_change"] is not None:
+        fields["周环比Top30词"] = ahrefs_summary["top30_week_change"]
+
+    fields = remove_none_values(fields)
+    fields["日期"] = data_date
+    fields["异常预警"] = build_dashboard_alert(gsc_summary, page_stats, traffic_week_change)
+
+    feishu.upsert_record(
+        table_id=config.feishu_table_dashboard_id,
+        key_field="日期",
+        key_value=data_date,
+        fields=fields,
+        table_label=TABLE_LABELS["dashboard"],
+    )
+
+
+def sync_keywords(config: Config, feishu: FeishuClient, ahrefs: AhrefsClient, report: SyncReport) -> list[str]:
+    table = TABLE_LABELS["keywords"]
+    records = feishu.list_records(config.feishu_table_keywords_id)
+    if not records:
+        report.log_skip(table, "表格无记录，请先在飞书手动添加关键词行（填写「关键词内容」）")
+        return []
+
+    keywords = [
+        str(fields["关键词内容"])
+        for record in records
+        if (fields := record.get("fields", {})).get("关键词内容")
+    ]
+    if not keywords:
+        report.log_skip(table, f"共 {len(records)} 行，但没有一行填写「关键词内容」")
+        return []
+
+    ahrefs.load_organic_rankings()
+    ahrefs.preload_keyword_overview(keywords)
+    updated = 0
+    empty_keyword_rows = len(records) - len(keywords)
+    for record in records:
+        fields = record.get("fields", {})
+        keyword = fields.get("关键词内容")
+        if not keyword:
+            continue
+
+        metrics = ahrefs.get_keyword_metrics(str(keyword))
+        update_fields = {"日期": ahrefs.report_date}
+        update_fields.update(remove_none_values({
+            "搜索量（月）": metrics["volume"],
+            "KD难度": metrics["kd"],
+            "当前排名": metrics["position"],
+            "排名波动": metrics["rank_change"],
+        }))
+        feishu.update_record(
+            config.feishu_table_keywords_id,
+            record["record_id"],
+            update_fields,
+            table_label=table,
+            key_value=keyword,
+        )
+        updated += 1
+
+    if empty_keyword_rows:
+        report.log_skip(
+            table,
+            f"{empty_keyword_rows} 行为空行（未填「关键词内容」），已跳过；已成功更新 {updated} 行",
+        )
+    elif updated == 0:
+        report.log_skip(table, "没有可更新的关键词行")
+    return keywords
+
+
+def sync_pages(
+    config: Config,
+    feishu: FeishuClient,
+    gsc: GSCClient,
+    report: SyncReport,
+) -> dict[str, int]:
+    table = TABLE_LABELS["pages"]
+    data_date = get_target_date(config)
+    records = feishu.list_records(config.feishu_table_pages_id)
+    if not records:
+        report.log_skip(table, "表格无记录，请先在飞书手动添加页面行（填写「页面URL」）")
+        return {"indexed_pages": 0, "crawl_issues": 0, "updated": 0}
+
+    indexed_pages = 0
+    crawl_issues = 0
+    updated = 0
+    empty_url_rows = 0
+    for record in records:
+        fields = record.get("fields", {})
+        raw_url = normalize_feishu_url(fields.get("页面URL"))
+        if not raw_url:
+            empty_url_rows += 1
+            continue
+
+        page_url = normalize_page_url_for_gsc(raw_url, config.gsc_site_url)
+        if not page_url_belongs_to_property(page_url, config.gsc_site_url):
+            report.log_skip(
+                table,
+                f"record={record['record_id']} URL 不在 GSC 资源内: {raw_url} "
+                f"(需与 {config.gsc_site_url} 一致，含 www/协议/路径)",
+            )
+            continue
+
+        clicks = gsc.query_page_clicks(data_date, page_url)
+        index_status = gsc.inspect_page_index_status(page_url)
+        update_fields: dict[str, Any] = {
+            "日期": data_date,
+            "页面流量": clicks,
+        }
+        if index_status is not None:
+            update_fields["收录状态"] = index_status
+            if index_status == "已收录":
+                indexed_pages += 1
+            else:
+                crawl_issues += 1
+        else:
+            report.log_skip(table, f"record={record['record_id']} 收录状态未检测: {page_url}")
+
+        feishu.update_record(
+            config.feishu_table_pages_id,
+            record["record_id"],
+            update_fields,
+            table_label=table,
+            key_value=page_url,
+        )
+        updated += 1
+
+    if empty_url_rows:
+        report.log_skip(
+            table,
+            f"{empty_url_rows} 行为空行（未填「页面URL」），已跳过；已成功更新 {updated} 行",
+        )
+    elif updated == 0:
+        report.log_skip(table, "没有可更新的页面行")
+
+    stats = {"indexed_pages": indexed_pages, "crawl_issues": crawl_issues, "updated": updated}
+    report.log_api(
+        "GSC",
+        "page index summary",
+        detail=f"indexed={indexed_pages} crawl_issues={crawl_issues} updated_pages={updated}",
+    )
+    return stats
+
+
+def sync_backlinks(config: Config, feishu: FeishuClient, ahrefs: AhrefsClient, report: SyncReport) -> None:
+    table = TABLE_LABELS["backlinks"]
+    data_date = ahrefs.report_date
+    records = feishu.list_records(config.feishu_table_backlinks_id)
+    if not records:
+        report.log_skip(table, "表格无记录，请先在飞书手动添加外链行（填写「外链来源域名」）")
+        return
+
+    updated = 0
+    empty_domain_rows = 0
+    for record in records:
+        fields = record.get("fields", {})
+        domain = normalize_domain(normalize_feishu_url(fields.get("外链来源域名")))
+        if not domain:
+            empty_domain_rows += 1
+            continue
+
+        metrics = ahrefs.get_domain_rating(domain)
+        update_fields: dict[str, Any] = {"日期": data_date}
+        update_fields.update(remove_none_values({
+            "域名DR值": metrics["dr"],
+        }))
+        if metrics["is_indexed"] is True:
+            update_fields["外链收录状态"] = "已收录"
+        elif metrics["is_indexed"] is False:
+            update_fields["外链收录状态"] = "未收录"
+
+        feishu.update_record(
+            config.feishu_table_backlinks_id,
+            record["record_id"],
+            update_fields,
+            table_label=table,
+            key_value=domain,
+        )
+        updated += 1
+
+    if empty_domain_rows:
+        report.log_skip(
+            table,
+            f"{empty_domain_rows} 行为空行（未填「外链来源域名」），已跳过；已成功更新 {updated} 行",
+        )
+    elif updated == 0:
+        report.log_skip(table, "没有可更新的外链行")
 
 
 def format_rank_change(diff: Any) -> str:
@@ -508,115 +1133,6 @@ def normalize_domain(value: str) -> str:
     return hostname.lower().removeprefix("www.")
 
 
-def sync_dashboard(
-    config: Config,
-    feishu: FeishuClient,
-    gsc: GSCClient,
-    ahrefs: AhrefsClient,
-    tracked_keywords: list[str],
-) -> None:
-    target_date = dt.date.today() - dt.timedelta(days=config.data_delay_days)
-    gsc_summary = gsc.query_site_summary(target_date)
-    ahrefs_summary = ahrefs.get_dashboard_summary(tracked_keywords)
-
-    fields = {
-        "日期": target_date.isoformat(),
-        "自然点击（GSC）": gsc_summary["clicks"],
-        "展示量（GSC）": gsc_summary["impressions"],
-        "平均CTR": gsc_summary["ctr"],
-        "全站平均排名": gsc_summary["position"],
-        "异常预警": "正常",
-    }
-    fields.update(remove_none_values({
-        "核心词Top10数量": ahrefs_summary["top10_count"],
-        "核心词Top30数量": ahrefs_summary["top30_count"],
-        "今日新增RD（referring domain）": ahrefs_summary["new_referring_domains"],
-    }))
-
-    feishu.upsert_record(
-        table_id=config.feishu_table_dashboard_id,
-        key_field="日期",
-        key_value=target_date.isoformat(),
-        fields=fields,
-    )
-
-
-def sync_keywords(config: Config, feishu: FeishuClient, ahrefs: AhrefsClient) -> list[str]:
-    records = feishu.list_records(config.feishu_table_keywords_id)
-    keywords = [
-        str(fields["关键词内容"])
-        for record in records
-        if (fields := record.get("fields", {})).get("关键词内容")
-    ]
-    ahrefs.load_organic_rankings()
-    ahrefs.preload_keyword_overview(keywords)
-
-    for record in records:
-        fields = record.get("fields", {})
-        keyword = fields.get("关键词内容")
-        if not keyword:
-            continue
-
-        metrics = ahrefs.get_keyword_metrics(str(keyword))
-        update_fields = {
-            "搜索量（月）": metrics["volume"],
-            "KD难度": metrics["kd"],
-            "当前排名": metrics["position"],
-            "排名波动": metrics["rank_change"],
-        }
-        update_fields = remove_none_values(update_fields)
-        if update_fields:
-            feishu.update_record(
-                config.feishu_table_keywords_id,
-                record["record_id"],
-                update_fields,
-            )
-    return keywords
-
-
-def sync_pages(config: Config, feishu: FeishuClient, gsc: GSCClient) -> None:
-    target_date = dt.date.today() - dt.timedelta(days=config.data_delay_days)
-    records = feishu.list_records(config.feishu_table_pages_id)
-    for record in records:
-        fields = record.get("fields", {})
-        page_url = normalize_feishu_url(fields.get("页面URL"))
-        if not page_url:
-            continue
-
-        clicks = gsc.query_page_clicks(target_date, page_url)
-        feishu.update_record(
-            config.feishu_table_pages_id,
-            record["record_id"],
-            {
-                "页面流量": clicks,
-            },
-        )
-
-
-def sync_backlinks(config: Config, feishu: FeishuClient, ahrefs: AhrefsClient) -> None:
-    records = feishu.list_records(config.feishu_table_backlinks_id)
-    for record in records:
-        fields = record.get("fields", {})
-        domain = normalize_domain(normalize_feishu_url(fields.get("外链来源域名")))
-        if not domain:
-            continue
-
-        metrics = ahrefs.get_domain_rating(domain)
-        update_fields: dict[str, Any] = remove_none_values({
-            "域名DR值": metrics["dr"],
-        })
-        if metrics["is_indexed"] is True:
-            update_fields["外链收录状态"] = "已收录"
-        elif metrics["is_indexed"] is False:
-            update_fields["外链收录状态"] = "未收录"
-        if update_fields:
-            feishu.update_record(
-                config.feishu_table_backlinks_id,
-                record["record_id"],
-                update_fields,
-            )
-
-
 def normalize_feishu_url(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
@@ -625,6 +1141,30 @@ def normalize_feishu_url(value: Any) -> str:
     if isinstance(value, list) and value:
         return normalize_feishu_url(value[0])
     return ""
+
+
+def normalize_page_url_for_gsc(page_url: str, site_url: str) -> str:
+    raw = page_url.strip()
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    base = site_url.rstrip("/")
+    if raw.startswith("/"):
+        return f"{base}{raw}"
+    return f"{base}/{raw.lstrip('/')}"
+
+
+def page_url_belongs_to_property(page_url: str, site_url: str) -> bool:
+    if not page_url:
+        return False
+    if site_url.startswith("sc-domain:"):
+        domain = site_url.removeprefix("sc-domain:").lower()
+        host = urlparse(page_url).netloc.lower().removeprefix("www.")
+        return host == domain or host.endswith(f".{domain}")
+    prefix = site_url.rstrip("/").lower()
+    normalized = page_url.rstrip("/").lower()
+    return normalized.startswith(prefix)
 
 
 def remove_none_values(data: dict[str, Any]) -> dict[str, Any]:
@@ -636,16 +1176,21 @@ def main() -> None:
     logging.info("SEO Feishu data sync started")
 
     config = Config.load()
-    feishu = FeishuClient(config)
-    gsc = GSCClient(config)
-    ahrefs = AhrefsClient(config)
+    report = SyncReport(started_at=dt.datetime.now(), data_date=get_target_date(config), config=config)
+    feishu = FeishuClient(config, report)
+    gsc = GSCClient(config, report)
+    ahrefs = AhrefsClient(config, report)
 
-    tracked_keywords = sync_keywords(config, feishu, ahrefs)
-    sync_dashboard(config, feishu, gsc, ahrefs, tracked_keywords)
-    sync_pages(config, feishu, gsc)
-    sync_backlinks(config, feishu, ahrefs)
+    report.log_skip("SEO每日执行", "该表以人工填写为主，当前脚本不自动写入")
+    report.log_skip("周绩效复盘", "该表以人工填写为主，当前脚本不自动写入")
 
-    logging.info("SEO Feishu data sync finished")
+    tracked_keywords = sync_keywords(config, feishu, ahrefs, report)
+    page_stats = sync_pages(config, feishu, gsc, report)
+    sync_dashboard(config, feishu, gsc, ahrefs, tracked_keywords, page_stats, report)
+    sync_backlinks(config, feishu, ahrefs, report)
+
+    report_path = report.save()
+    logging.info("SEO Feishu data sync finished. Report: %s", report_path)
 
 
 if __name__ == "__main__":

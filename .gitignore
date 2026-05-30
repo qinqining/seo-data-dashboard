@@ -4,5 +4,6 @@ client_secret.json
 token.json
 .venv/
 logs/
+reports/
 __pycache__/
 *.pyc

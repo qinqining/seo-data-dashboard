@@ -16,7 +16,7 @@ echo.
 if errorlevel 1 (
   echo Sync failed. Check the latest file in logs\
 ) else (
-  echo Sync finished.
+  echo Sync finished. See reports\ for the latest sync-report-*.txt
 )
 echo.
 pause
