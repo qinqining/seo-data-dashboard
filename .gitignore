@@ -7,3 +7,5 @@ logs/
 reports/
 __pycache__/
 *.pyc
+docs/seo-data-dashboard-note1.md
+~$*.xlsx

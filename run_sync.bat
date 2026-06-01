@@ -7,9 +7,9 @@ echo SEO data sync started. This may take a few minutes...
 echo.
 
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" sync.py
+  ".venv\Scripts\python.exe" script\sync.py %*
 ) else (
-  python sync.py
+  python script\sync.py %*
 )
 
 echo.

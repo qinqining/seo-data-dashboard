@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /d D:\\\\seo-data-dashboard)",
+      "Bash(python -c ' *)",
+      "Bash(python *)"
+    ]
+  }
+}

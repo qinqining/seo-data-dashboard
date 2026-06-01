@@ -10,9 +10,8 @@ if not exist ".venv" (
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 ".venv\Scripts\pip.exe" install -r requirements.txt
 
-if not exist "logs" (
-  mkdir logs
-)
+if not exist "logs" mkdir logs
+if not exist "reports" mkdir reports
 
 rem Remove legacy daily scheduled task if install.bat was run before.
 schtasks /Delete /TN "SEO Feishu Data Sync" /F >nul 2>&1

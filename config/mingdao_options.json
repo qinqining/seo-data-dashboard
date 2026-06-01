@@ -1,0 +1,14 @@
+{
+  "sites": {
+    "cncpioneer": "06445848-cf1b-4d3d-a63d-5da8ac85c093",
+    "fecision": "386f967d-e856-4b2e-8c23-150cdf954576",
+    "richconn": "6d259ea7-aa61-4051-bb06-0f981647ab9b",
+    "lasermicrofab": "e9bbf789-6dd6-4d01-a006-8f63ef2dd37b",
+    "drametal": "ad526b77-49df-4af2-9c1b-f62c95f2a16b"
+  },
+  "alerts": {
+    "正常": "6d259ea7-aa61-4051-bb06-0f981647ab9b",
+    "流量下跌": "06445848-cf1b-4d3d-a63d-5da8ac85c093",
+    "收录异常": "386f967d-e856-4b2e-8c23-150cdf954576"
+  }
+}
