@@ -1,0 +1,29 @@
+{
+  "sites": [
+    {
+      "key": "cncpioneer",
+      "gsc_site_url": "https://www.cncpioneer.com/",
+      "ahrefs_domain": "cncpioneer.com"
+    },
+    {
+      "key": "fecision",
+      "gsc_site_url": "https://fecision.com/",
+      "ahrefs_domain": "fecision.com"
+    },
+    {
+      "key": "richconn",
+      "gsc_site_url": "https://www.richconn.com/",
+      "ahrefs_domain": "richconn.com"
+    },
+    {
+      "key": "lasermicrofab",
+      "gsc_site_url": "https://www.lasermicrofab.com/",
+      "ahrefs_domain": "lasermicrofab.com"
+    },
+    {
+      "key": "drametal",
+      "gsc_site_url": "https://www.drametal.com/",
+      "ahrefs_domain": "drametal.com"
+    }
+  ]
+}

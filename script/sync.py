@@ -37,8 +37,58 @@ ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT / "logs"
 REPORT_DIR = ROOT / "reports"
 OPTIONS_FILE = ROOT / "config" / "mingdao_options.json"
+SITES_FILE = ROOT / "config" / "sites.json"
 LOG_DIR.mkdir(exist_ok=True)
 REPORT_DIR.mkdir(exist_ok=True)
+
+load_dotenv(ROOT / ".env")
+
+
+def apply_proxy_env() -> None:
+    """Load optional proxy vars from .env (Google 默认不强制走 HTTPS_PROXY)。"""
+    for key in ("MINGDAO_PROXY", "AHREFS_PROXY", "GOOGLE_PROXY", "NO_PROXY"):
+        value = os.getenv(key, "").strip()
+        if value:
+            os.environ[key] = value
+
+
+def parse_proxy_value(value: str) -> dict[str, str]:
+    raw = value.strip()
+    if not raw or raw.lower() in {"none", "direct", "off", "false", "0", "tun"}:
+        return {}
+    return {"http": raw, "https": raw}
+
+
+def get_google_proxies() -> dict[str, str]:
+    """仅当 .env 显式设置 GOOGLE_PROXY 时才手动指定；否则走系统代理（Clash 全局/规则）。"""
+    explicit = (os.getenv("GOOGLE_PROXY") or "").strip()
+    if explicit:
+        return parse_proxy_value(explicit)
+    if os.getenv("GOOGLE_USE_HTTPS_PROXY", "").lower() in {"1", "true", "yes"}:
+        http = (os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+        if http:
+            return {"http": http, "https": http}
+    return {}
+
+
+def configure_google_session(session: requests.Session) -> None:
+    google_proxy = get_google_proxies()
+    if google_proxy:
+        session.trust_env = False
+        session.proxies.update(google_proxy)
+        logging.info("Google API proxy (manual): %s", google_proxy["https"])
+    else:
+        # 无 TUN 时：Clash 全局/智能 +「系统代理」即可（与上周飞书同步相同思路）
+        session.trust_env = True
+        session.proxies.clear()
+        logging.info("Google API proxy: system (Clash 全局/规则，请开启系统代理)")
+
+
+def get_mingdao_proxies() -> dict[str, str]:
+    return parse_proxy_value(os.getenv("MINGDAO_PROXY", ""))
+
+
+apply_proxy_env()
 
 DASHBOARD_LABEL = "SEO自动数据看板"
 
@@ -98,9 +148,7 @@ class SyncReport:
             f"Started : {self.started_at.isoformat(sep=' ', timespec='seconds')}",
             f"Finished: {finished_at.isoformat(sep=' ', timespec='seconds')}",
             f"Data date: {self.data_date.isoformat()} (today - DATA_DELAY_DAYS={self.config.data_delay_days})",
-            f"Site      : {self.config.sync_site}",
-            f"GSC site  : {self.config.gsc_site_url}",
-            f"Ahrefs    : {self.config.ahrefs_target_domain}",
+            f"Sites     : {', '.join(site.key for site in self.config.sites)}",
             "",
             f"API calls ({len(self.api_calls)})",
             "-" * 60,
@@ -159,29 +207,38 @@ class DashboardFieldIds:
 
 
 @dataclass(frozen=True)
+class SiteConfig:
+    key: str
+    gsc_site_url: str
+    ahrefs_domain: str
+
+
+@dataclass(frozen=True)
 class Config:
     mingdao_app_key: str
     mingdao_sign: str
     mingdao_api_base: str
     mingdao_worksheet_dashboard: str
     dashboard_fields: DashboardFieldIds
-    sync_site: str
+    sites: tuple[SiteConfig, ...]
     site_option_keys: dict[str, str]
     alert_option_keys: dict[str, str]
-    gsc_site_url: str
     google_auth_mode: str
     google_credentials_file: str
     google_client_secret_file: str
     google_token_file: str
     ahrefs_api_token: str
-    ahrefs_target_domain: str
     ahrefs_target_country: str
     data_delay_days: int
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls, *, site_filter: list[str] | None = None) -> "Config":
         load_dotenv(ROOT / ".env")
+        apply_proxy_env()
         options = load_mingdao_options()
+        env_filter = os.getenv("SYNC_SITES", "").strip()
+        if site_filter is None and env_filter:
+            site_filter = [part.strip() for part in env_filter.split(",") if part.strip()]
         return cls(
             mingdao_app_key=env_required("MINGDAO_APP_KEY"),
             mingdao_sign=env_required("MINGDAO_SIGN"),
@@ -203,25 +260,23 @@ class Config:
                 traffic_wow=env_required("MINGDAO_FIELD_DASH_TRAFFIC_WOW"),
                 top30_wow=env_required("MINGDAO_FIELD_DASH_TOP30_WOW"),
             ),
-            sync_site=env_required("SYNC_SITE"),
+            sites=tuple(load_sites(site_filter)),
             site_option_keys=options["sites"],
             alert_option_keys=options["alerts"],
-            gsc_site_url=env_required("GSC_SITE_URL").strip(),
             google_auth_mode=os.getenv("GOOGLE_AUTH_MODE", "oauth").lower(),
             google_credentials_file=os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json"),
             google_client_secret_file=os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json"),
             google_token_file=os.getenv("GOOGLE_TOKEN_FILE", "token.json"),
             ahrefs_api_token=env_required("AHREFS_API_TOKEN"),
-            ahrefs_target_domain=normalize_ahrefs_domain(env_required("AHREFS_TARGET_DOMAIN")),
             ahrefs_target_country=os.getenv("AHREFS_TARGET_COUNTRY", "us"),
             data_delay_days=int(os.getenv("DATA_DELAY_DAYS", "2")),
         )
 
-    def site_option_key(self) -> str:
-        key = self.site_option_keys.get(self.sync_site)
+    def site_option_key(self, site_key: str) -> str:
+        key = self.site_option_keys.get(site_key)
         if not key:
             known = ", ".join(sorted(self.site_option_keys))
-            raise RuntimeError(f"Unknown SYNC_SITE={self.sync_site!r}. Known: {known}")
+            raise RuntimeError(f"Unknown site {site_key!r}. Known: {known}")
         return key
 
     def alert_option_key(self, label: str) -> str:
@@ -237,6 +292,36 @@ def load_mingdao_options() -> dict[str, dict[str, str]]:
         raise RuntimeError(f"Missing {OPTIONS_FILE}")
     payload = json.loads(OPTIONS_FILE.read_text(encoding="utf-8"))
     return {"sites": payload["sites"], "alerts": payload["alerts"]}
+
+
+def normalize_gsc_site_url(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = f"https://{raw}"
+    return raw
+
+
+def load_sites(site_filter: list[str] | None = None) -> list[SiteConfig]:
+    if not SITES_FILE.exists():
+        raise RuntimeError(f"Missing {SITES_FILE}")
+    payload = json.loads(SITES_FILE.read_text(encoding="utf-8"))
+    sites: list[SiteConfig] = []
+    for item in payload.get("sites", []):
+        key = str(item["key"]).strip()
+        if site_filter and key not in site_filter:
+            continue
+        sites.append(
+            SiteConfig(
+                key=key,
+                gsc_site_url=normalize_gsc_site_url(str(item["gsc_site_url"])),
+                ahrefs_domain=normalize_ahrefs_domain(str(item["ahrefs_domain"])),
+            )
+        )
+    if not sites:
+        raise RuntimeError("No sites to sync. Check config/sites.json or SYNC_SITES filter.")
+    return sites
 
 
 def env_required(name: str) -> str:
@@ -271,6 +356,10 @@ class MingdaoClient:
         self.report = report
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        mingdao_proxy = get_mingdao_proxies()
+        if mingdao_proxy:
+            self.session.proxies.update(mingdao_proxy)
+            self.session.trust_env = False
 
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.config.mingdao_api_base}/{endpoint.lstrip('/')}"
@@ -284,6 +373,9 @@ class MingdaoClient:
         data = resp.json()
         ok = data.get("success") is True or data.get("error_code") == 1
         if not ok:
+            if self.report:
+                preview = json.dumps({k: v for k, v in payload.items() if k not in {"sign"}}, ensure_ascii=False)[:500]
+                self.report.log_api("Mingdao", endpoint, ok=False, detail=f"{data} payload={preview}")
             raise RuntimeError(f"Mingdao API error ({endpoint}): {data}")
         return data
 
@@ -342,8 +434,12 @@ class MingdaoClient:
         return rows[0] if rows else None
 
     def add_row(self, worksheet_id: str, controls: list[dict[str, str]]) -> str:
+        if not controls:
+            raise RuntimeError("Mingdao addRow: controls 为空，请检查字段映射与数据")
+
+        # addRows 批量接口要求 rows=[[{controlId,value},...]]；addRow 单条用 controls
         data = self._post(
-            "addRows",
+            "addRow",
             {
                 "worksheetId": worksheet_id,
                 "controls": controls,
@@ -352,7 +448,11 @@ class MingdaoClient:
         )
         row_id = data.get("data")
         if self.report:
-            self.report.log_api("Mingdao", "addRows", detail=f"rowId={row_id}")
+            self.report.log_api(
+                "Mingdao",
+                "addRow",
+                detail=f"rowId={row_id} fields={len(controls)}",
+            )
         return str(row_id)
 
     def edit_row(self, worksheet_id: str, row_id: str, controls: list[dict[str, str]]) -> None:
@@ -368,13 +468,24 @@ class MingdaoClient:
         if self.report:
             self.report.log_api("Mingdao", "editRow", detail=f"rowId={row_id}")
 
-    def upsert_dashboard(self, data_date: dt.date, logical_fields: dict[str, Any]) -> None:
-        fields = self.config.dashboard_fields
-        site_key = self.config.site_option_key()
-        controls = build_dashboard_controls(self.config, logical_fields)
+    def upsert_dashboard(self, data_date: dt.date, logical_fields: dict[str, Any], site_key: str) -> None:
+        site_option = self.config.site_option_key(site_key)
+        controls = build_dashboard_controls(self.config, logical_fields, site_key)
 
-        existing = self.find_dashboard_row(data_date, site_key)
-        key = f"{self.config.sync_site}@{data_date.isoformat()}"
+        if self.report:
+            self.report.log_api(
+                "Mingdao",
+                "build controls",
+                detail=f"count={len(controls)} site={site_key} date={data_date.isoformat()}",
+            )
+            if not controls:
+                self.report.log_skip(DASHBOARD_LABEL, "controls 为空，未调用写入 API")
+
+        if not controls:
+            raise RuntimeError("明道云写入失败：未生成任何字段数据（controls 为空）")
+
+        existing = self.find_dashboard_row(data_date, site_option)
+        key = f"{site_key}@{data_date.isoformat()}"
         if existing:
             row_id = existing["rowid"]
             self.edit_row(self.config.mingdao_worksheet_dashboard, row_id, controls)
@@ -386,7 +497,7 @@ class MingdaoClient:
                 self.report.log_write(DASHBOARD_LABEL, "create", key, logical_fields)
 
 
-def build_dashboard_controls(config: Config, logical_fields: dict[str, Any]) -> list[dict[str, str]]:
+def build_dashboard_controls(config: Config, logical_fields: dict[str, Any], site_key: str) -> list[dict[str, str]]:
     fields = config.dashboard_fields
     mapping = {
         "日期": fields.date,
@@ -415,7 +526,7 @@ def build_dashboard_controls(config: Config, logical_fields: dict[str, Any]) -> 
         if name == "日期":
             controls.append({"controlId": control_id, "value": format_mingdao_date(value)})
         elif name == "独立站":
-            controls.append({"controlId": control_id, "value": config.site_option_key()})
+            controls.append({"controlId": control_id, "value": config.site_option_key(site_key)})
         elif name == "异常预警":
             controls.append({"controlId": control_id, "value": config.alert_option_key(str(value))})
         else:
@@ -441,18 +552,19 @@ def format_mingdao_number(value: Any) -> str:
 class GSCClient:
     SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
     API_BASE = "https://searchconsole.googleapis.com/webmasters/v3"
-    REQUEST_TIMEOUT = 60
+    REQUEST_TIMEOUT = (15, 45)
     MAX_RETRIES = 3
 
-    def __init__(self, config: Config, report: SyncReport | None = None):
+    def __init__(self, config: Config, report: SyncReport | None = None, *, site_url: str):
         if AuthorizedSession is None or Request is None:
             raise RuntimeError("Google API dependencies are not installed.")
 
         self.config = config
         self.report = report
-        self.site_url = config.gsc_site_url
+        self.site_url = site_url
         credentials = self._load_credentials()
         self.session = AuthorizedSession(credentials)
+        configure_google_session(self.session)
 
     def _load_credentials(self) -> Any:
         if self.config.google_auth_mode == "service_account":
@@ -484,11 +596,17 @@ class GSCClient:
             credentials = Credentials.from_authorized_user_file(token_path, self.SCOPES)
 
         if credentials and credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
+            refresh_session = requests.Session()
+            configure_google_session(refresh_session)
+            credentials.refresh(Request(session=refresh_session))
 
         if not credentials or not credentials.valid:
             if not client_secret_path.exists():
                 raise RuntimeError(f"Google OAuth client secret file not found: {client_secret_path}")
+            if not get_google_proxies():
+                logging.info(
+                    "Google OAuth 使用系统代理；请确认 Clash 已开启「系统代理」，全局或智能模式均可。"
+                )
             logging.info("Opening browser for Google OAuth. Complete login to create token.json.")
             flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, self.SCOPES)
             credentials = flow.run_local_server(port=0)
@@ -520,7 +638,7 @@ class GSCClient:
                 "GSC",
                 "searchAnalytics/query (site summary)",
                 detail=(
-                    f"date={date_value.isoformat()} clicks={summary['clicks']} "
+                    f"site={self.site_url} date={date_value.isoformat()} clicks={summary['clicks']} "
                     f"impressions={summary['impressions']} ctr={summary['ctr']} "
                     f"position={summary['position']}"
                 ),
@@ -540,7 +658,7 @@ class GSCClient:
             self.report.log_api(
                 "GSC",
                 "searchAnalytics/query (clicks sum)",
-                detail=f"range={start_date.isoformat()}..{end_date.isoformat()} clicks={clicks}",
+                detail=f"site={self.site_url} range={start_date.isoformat()}..{end_date.isoformat()} clicks={clicks}",
             )
         return clicks
 
@@ -563,7 +681,11 @@ class GSCClient:
                     time.sleep(2)
 
         raise RuntimeError(
-            "无法连接 Google Search Console API。请检查网络/VPN/代理，或在 .env 中设置 HTTPS_PROXY 后重试。"
+            "无法连接 Google Search Console API。"
+            "请确认：1) Clash 已开全局或智能模式，并开启「系统代理」；"
+            "2) .env 不要设置 HTTPS_PROXY（改用系统代理，与上周飞书同步相同）；"
+            "3) GSC_SITE_URL 与 Search Console 资源一致。"
+            f" 原始错误: {last_error}"
         ) from last_error
 
     @staticmethod
@@ -589,9 +711,18 @@ class GSCClient:
 class AhrefsClient:
     BASE_URL = "https://api.ahrefs.com/v3"
 
-    def __init__(self, config: Config, report: SyncReport | None = None):
+    def __init__(
+        self,
+        config: Config,
+        report: SyncReport | None = None,
+        *,
+        target_domain: str,
+        site_key: str = "",
+    ):
         self.config = config
         self.report = report
+        self.target_domain = normalize_ahrefs_domain(target_domain)
+        self.site_key = site_key
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -610,7 +741,7 @@ class AhrefsClient:
         payload = self._request(
             "site-explorer/organic-keywords",
             {
-                "target": self.config.ahrefs_target_domain,
+                "target": self.target_domain,
                 "country": self.config.ahrefs_target_country.lower(),
                 "date": self.report_date.isoformat(),
                 "date_compared": self.compare_date.isoformat(),
@@ -629,7 +760,7 @@ class AhrefsClient:
             self.report.log_api(
                 "Ahrefs",
                 "site-explorer/organic-keywords",
-                detail=f"date={self.report_date.isoformat()} count={len(rankings)}",
+                detail=f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} count={len(rankings)}",
             )
         return rankings
 
@@ -661,7 +792,7 @@ class AhrefsClient:
                 "Ahrefs",
                 "dashboard summary",
                 detail=(
-                    f"top10={top10_count} top30={top30_count} new_rd={new_rd} "
+                    f"site={self.site_key} top10={top10_count} top30={top30_count} new_rd={new_rd} "
                     f"top30_week_change={top30_change}"
                 ),
             )
@@ -672,7 +803,7 @@ class AhrefsClient:
         payload = self._request(
             "site-explorer/refdomains-history",
             {
-                "target": self.config.ahrefs_target_domain,
+                "target": self.target_domain,
                 "date_from": start_date.isoformat(),
                 "date_to": self.report_date.isoformat(),
                 "history_grouping": "daily",
@@ -687,7 +818,7 @@ class AhrefsClient:
             self.report.log_api(
                 "Ahrefs",
                 "site-explorer/refdomains-history",
-                detail=f"range={start_date.isoformat()}..{self.report_date.isoformat()} delta={delta}",
+                detail=f"site={self.site_key} range={start_date.isoformat()}..{self.report_date.isoformat()} delta={delta}",
             )
         return delta
 
@@ -721,6 +852,7 @@ def sync_dashboard(
     gsc: GSCClient,
     ahrefs: AhrefsClient,
     report: SyncReport,
+    site: SiteConfig,
 ) -> None:
     data_date = get_target_date(config)
     gsc_summary = gsc.query_site_summary(data_date)
@@ -735,7 +867,7 @@ def sync_dashboard(
 
     fields: dict[str, Any] = {
         "日期": data_date,
-        "独立站": config.sync_site,
+        "独立站": site.key,
         "自然点击": gsc_summary["clicks"],
         "展示量": gsc_summary["impressions"],
         "平均CTR": gsc_summary["ctr"],
@@ -753,16 +885,21 @@ def sync_dashboard(
         fields["周环比Top30词"] = round(ahrefs_summary["top30_week_change"], 4)
 
     fields = {key: value for key, value in fields.items() if value is not None}
-    mingdao.upsert_dashboard(data_date, fields)
+    report.log_api(
+        "sync",
+        f"dashboard payload ({site.key})",
+        detail=format_fields_for_report(fields),
+    )
+    mingdao.upsert_dashboard(data_date, fields, site.key)
     report.log_skip("页面管理表", "二期接入；收录数/异常数暂写 0")
     report.log_skip("关键词/外链表", "二期接入 Mingdao")
 
 
-def run_sync(*, test_mingdao_only: bool = False) -> Path:
+def run_sync(*, test_mingdao_only: bool = False, site_filter: list[str] | None = None) -> Path:
     setup_logging()
     logging.info("SEO Mingdao data sync started")
 
-    config = Config.load()
+    config = Config.load(site_filter=site_filter)
     report = SyncReport(started_at=dt.datetime.now(), data_date=get_target_date(config), config=config)
     mingdao = MingdaoClient(config, report)
 
@@ -772,9 +909,15 @@ def run_sync(*, test_mingdao_only: bool = False) -> Path:
         report.log_skip("sync", "test-mingdao-only: skipped GSC/Ahrefs write")
         return report.save()
 
-    gsc = GSCClient(config, report)
-    ahrefs = AhrefsClient(config, report)
-    sync_dashboard(config, mingdao, gsc, ahrefs, report)
+    for site in config.sites:
+        logging.info("Syncing site: %s (GSC=%s, Ahrefs=%s)", site.key, site.gsc_site_url, site.ahrefs_domain)
+        try:
+            gsc = GSCClient(config, report, site_url=site.gsc_site_url)
+            ahrefs = AhrefsClient(config, report, target_domain=site.ahrefs_domain, site_key=site.key)
+            sync_dashboard(config, mingdao, gsc, ahrefs, report, site)
+        except Exception as exc:
+            report.log_warning(f"{site.key} sync failed: {exc}")
+            logging.exception("Site sync failed: %s", site.key)
 
     report_path = report.save()
     logging.info("SEO Mingdao data sync finished. Report: %s", report_path)
@@ -788,12 +931,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only test Mingdao getFilterRows; do not call GSC/Ahrefs or write dashboard",
     )
+    parser.add_argument(
+        "--site",
+        action="append",
+        dest="sites",
+        metavar="SITE",
+        help="Sync only this site key (repeatable). Default: all sites in config/sites.json",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_sync(test_mingdao_only=args.test_mingdao_only)
+    run_sync(test_mingdao_only=args.test_mingdao_only, site_filter=args.sites)
 
 
 if __name__ == "__main__":
