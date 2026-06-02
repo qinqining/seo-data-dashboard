@@ -22,16 +22,24 @@ import requests
 from dotenv import load_dotenv
 
 try:
+    from google.auth import exceptions as google_auth_exceptions
     from google.auth.transport.requests import AuthorizedSession, Request
     from google.oauth2 import service_account
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 except ImportError:
+    google_auth_exceptions = None
     AuthorizedSession = None
     Request = None
     service_account = None
     Credentials = None
     InstalledAppFlow = None
+
+# 443/SSL 等瞬时网络错误：整站重试 + OAuth 刷新重试（避免第 1 站失败导致后 4 站未跑）
+GOOGLE_CREDENTIAL_MAX_ATTEMPTS = 5
+GOOGLE_CREDENTIAL_RETRY_SECONDS = 4
+SITE_SYNC_MAX_ATTEMPTS = 3
+SITE_SYNC_RETRY_SECONDS = 5
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -203,14 +211,35 @@ class DashboardFieldIds:
     impressions: str
     ctr: str
     position: str
-    top10: str
-    top30: str
+    top1_3: str
+    top4_10: str
+    top11_20: str
+    top21_100: str
     rd_delta: str
     indexed: str
     issues: str
     alert: str
     traffic_wow: str
-    top30_wow: str
+    top1_3_wow: str
+    top4_10_wow: str
+    top11_20_wow: str
+    top21_100_wow: str
+
+
+# Ahrefs best_position 分档（有机词 API 仅含 Top100）
+RANK_BUCKET_SPECS: tuple[tuple[str, str, int, int], ...] = (
+    ("Top1-3词数", "top1_3", 1, 3),
+    ("Top4-10词数", "top4_10", 4, 10),
+    ("Top11-20词数", "top11_20", 11, 20),
+    ("Top21-100词数", "top21_100", 21, 100),
+)
+
+RANK_BUCKET_WOW_LABELS: dict[str, str] = {
+    "top1_3": "周环比Top1-3词",
+    "top4_10": "周环比Top4-10词",
+    "top11_20": "周环比Top11-20词",
+    "top21_100": "周环比Top21-100词",
+}
 
 
 @dataclass(frozen=True)
@@ -297,14 +326,19 @@ class Config:
                 impressions=env_required("MINGDAO_FIELD_DASH_IMPRESSIONS"),
                 ctr=env_required("MINGDAO_FIELD_DASH_CTR"),
                 position=env_required("MINGDAO_FIELD_DASH_POSITION"),
-                top10=env_required("MINGDAO_FIELD_DASH_TOP10"),
-                top30=env_required("MINGDAO_FIELD_DASH_TOP30"),
+                top1_3=env_required("MINGDAO_FIELD_DASH_TOP1_3"),
+                top4_10=env_required("MINGDAO_FIELD_DASH_TOP4_10"),
+                top11_20=env_required("MINGDAO_FIELD_DASH_TOP11_20"),
+                top21_100=env_required("MINGDAO_FIELD_DASH_TOP21_100"),
                 rd_delta=env_required("MINGDAO_FIELD_DASH_RD_DELTA"),
                 indexed=env_required("MINGDAO_FIELD_DASH_INDEXED"),
                 issues=env_required("MINGDAO_FIELD_DASH_ISSUES"),
                 alert=env_required("MINGDAO_FIELD_DASH_ALERT"),
                 traffic_wow=env_required("MINGDAO_FIELD_DASH_TRAFFIC_WOW"),
-                top30_wow=env_required("MINGDAO_FIELD_DASH_TOP30_WOW"),
+                top1_3_wow=env_required("MINGDAO_FIELD_DASH_TOP1_3_WOW"),
+                top4_10_wow=env_required("MINGDAO_FIELD_DASH_TOP4_10_WOW"),
+                top11_20_wow=env_required("MINGDAO_FIELD_DASH_TOP11_20_WOW"),
+                top21_100_wow=env_required("MINGDAO_FIELD_DASH_TOP21_100_WOW"),
             ),
             sites=tuple(load_sites(site_filter)),
             site_option_keys=options["sites"],
@@ -839,14 +873,19 @@ def build_dashboard_controls(config: Config, logical_fields: dict[str, Any], sit
         "展示量": fields.impressions,
         "平均CTR": fields.ctr,
         "全站加权平均排名": fields.position,
-        "Top10词数": fields.top10,
-        "Top30词数": fields.top30,
+        "Top1-3词数": fields.top1_3,
+        "Top4-10词数": fields.top4_10,
+        "Top11-20词数": fields.top11_20,
+        "Top21-100词数": fields.top21_100,
         "近7天RD变化": fields.rd_delta,
         "已监控URL收录数": fields.indexed,
         "已监控URL异常数": fields.issues,
         "异常预警": fields.alert,
         "周环比流量": fields.traffic_wow,
-        "周环比Top30词": fields.top30_wow,
+        "周环比Top1-3词": fields.top1_3_wow,
+        "周环比Top4-10词": fields.top4_10_wow,
+        "周环比Top11-20词": fields.top11_20_wow,
+        "周环比Top21-100词": fields.top21_100_wow,
     }
 
     controls: list[dict[str, str]] = []
@@ -882,70 +921,138 @@ def format_mingdao_number(value: Any) -> str:
     return str(value)
 
 
+def is_transient_network_error(exc: BaseException) -> bool:
+    """OAuth / GSC 常见的可重试网络错误（含 443 SSL EOF）。"""
+    if isinstance(exc, (requests.exceptions.SSLError, requests.exceptions.ConnectionError)):
+        return True
+    if google_auth_exceptions and isinstance(exc, google_auth_exceptions.TransportError):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = exc.response
+        if response is not None and response.status_code in {429, 500, 502, 503, 504}:
+            return True
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        return is_transient_network_error(cause)
+    return False
+
+
+def load_service_account_credentials(config: Config) -> Any:
+    if service_account is None:
+        raise RuntimeError("Google service account dependency is not installed.")
+    credentials_path = ROOT / config.google_credentials_file
+    if not credentials_path.exists():
+        raise RuntimeError(f"Google credentials file not found: {credentials_path}")
+    return service_account.Credentials.from_service_account_file(
+        credentials_path,
+        scopes=GSCClient.SCOPES,
+    )
+
+
+def load_oauth_credentials(config: Config) -> Any:
+    if Credentials is None or Request is None or InstalledAppFlow is None:
+        raise RuntimeError("Google OAuth dependencies are not installed.")
+
+    token_path = ROOT / config.google_token_file
+    client_secret_path = ROOT / config.google_client_secret_file
+    credentials = None
+
+    if token_path.exists():
+        credentials = Credentials.from_authorized_user_file(token_path, GSCClient.SCOPES)
+
+    if credentials and credentials.expired and credentials.refresh_token:
+        last_error: Exception | None = None
+        for attempt in range(1, GOOGLE_CREDENTIAL_MAX_ATTEMPTS + 1):
+            try:
+                refresh_session = requests.Session()
+                configure_google_session(refresh_session)
+                credentials.refresh(Request(session=refresh_session))
+                token_path.write_text(credentials.to_json(), encoding="utf-8")
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if not is_transient_network_error(exc) or attempt >= GOOGLE_CREDENTIAL_MAX_ATTEMPTS:
+                    raise
+                delay = GOOGLE_CREDENTIAL_RETRY_SECONDS * attempt
+                logging.warning(
+                    "Google OAuth token refresh failed (attempt %s/%s), retry in %ss: %s",
+                    attempt,
+                    GOOGLE_CREDENTIAL_MAX_ATTEMPTS,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        if last_error:
+            raise last_error
+
+    if not credentials or not credentials.valid:
+        if not client_secret_path.exists():
+            raise RuntimeError(f"Google OAuth client secret file not found: {client_secret_path}")
+        if not get_google_proxies():
+            logging.info(
+                "Google OAuth 使用系统代理；请确认 Clash 已开启「系统代理」，全局或智能模式均可。"
+            )
+        logging.info("Opening browser for Google OAuth. Complete login to create token.json.")
+        flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, GSCClient.SCOPES)
+        credentials = flow.run_local_server(port=0)
+        token_path.write_text(credentials.to_json(), encoding="utf-8")
+
+    return credentials
+
+
+def load_google_credentials_with_retry(config: Config) -> Any:
+    """整次 sync 只加载/刷新一次 Google 凭据，避免每站重复打 oauth2.googleapis.com。"""
+    last_error: Exception | None = None
+    for attempt in range(1, GOOGLE_CREDENTIAL_MAX_ATTEMPTS + 1):
+        try:
+            if config.google_auth_mode == "service_account":
+                return load_service_account_credentials(config)
+            if config.google_auth_mode == "oauth":
+                return load_oauth_credentials(config)
+            raise RuntimeError(f"Unsupported GOOGLE_AUTH_MODE: {config.google_auth_mode}")
+        except Exception as exc:
+            last_error = exc
+            if not is_transient_network_error(exc) or attempt >= GOOGLE_CREDENTIAL_MAX_ATTEMPTS:
+                raise
+            delay = GOOGLE_CREDENTIAL_RETRY_SECONDS * attempt
+            logging.warning(
+                "Google credentials load failed (attempt %s/%s), retry in %ss: %s",
+                attempt,
+                GOOGLE_CREDENTIAL_MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google credentials load failed")
+
+
 class GSCClient:
     SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
     API_BASE = "https://searchconsole.googleapis.com/webmasters/v3"
     REQUEST_TIMEOUT = (15, 45)
     MAX_RETRIES = 3
 
-    def __init__(self, config: Config, report: SyncReport | None = None, *, site_url: str):
+    def __init__(
+        self,
+        config: Config,
+        report: SyncReport | None = None,
+        *,
+        site_url: str,
+        credentials: Any | None = None,
+    ):
         if AuthorizedSession is None or Request is None:
             raise RuntimeError("Google API dependencies are not installed.")
 
         self.config = config
         self.report = report
         self.site_url = site_url
-        credentials = self._load_credentials()
+        if credentials is None:
+            credentials = load_google_credentials_with_retry(config)
         self.session = AuthorizedSession(credentials)
         configure_google_session(self.session)
-
-    def _load_credentials(self) -> Any:
-        if self.config.google_auth_mode == "service_account":
-            return self._load_service_account_credentials()
-        if self.config.google_auth_mode == "oauth":
-            return self._load_oauth_credentials()
-        raise RuntimeError(f"Unsupported GOOGLE_AUTH_MODE: {self.config.google_auth_mode}")
-
-    def _load_service_account_credentials(self) -> Any:
-        if service_account is None:
-            raise RuntimeError("Google service account dependency is not installed.")
-        credentials_path = ROOT / self.config.google_credentials_file
-        if not credentials_path.exists():
-            raise RuntimeError(f"Google credentials file not found: {credentials_path}")
-        return service_account.Credentials.from_service_account_file(
-            credentials_path,
-            scopes=self.SCOPES,
-        )
-
-    def _load_oauth_credentials(self) -> Any:
-        if Credentials is None or Request is None or InstalledAppFlow is None:
-            raise RuntimeError("Google OAuth dependencies are not installed.")
-
-        token_path = ROOT / self.config.google_token_file
-        client_secret_path = ROOT / self.config.google_client_secret_file
-        credentials = None
-
-        if token_path.exists():
-            credentials = Credentials.from_authorized_user_file(token_path, self.SCOPES)
-
-        if credentials and credentials.expired and credentials.refresh_token:
-            refresh_session = requests.Session()
-            configure_google_session(refresh_session)
-            credentials.refresh(Request(session=refresh_session))
-
-        if not credentials or not credentials.valid:
-            if not client_secret_path.exists():
-                raise RuntimeError(f"Google OAuth client secret file not found: {client_secret_path}")
-            if not get_google_proxies():
-                logging.info(
-                    "Google OAuth 使用系统代理；请确认 Clash 已开启「系统代理」，全局或智能模式均可。"
-                )
-            logging.info("Opening browser for Google OAuth. Complete login to create token.json.")
-            flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, self.SCOPES)
-            credentials = flow.run_local_server(port=0)
-            token_path.write_text(credentials.to_json(), encoding="utf-8")
-
-        return credentials
 
     def query_site_summary(self, date_value: dt.date) -> dict[str, Any]:
         body = {
@@ -1200,7 +1307,10 @@ class AhrefsClient:
                 "country": country.lower(),
                 "date": self.report_date.isoformat(),
                 "date_compared": self.compare_date.isoformat(),
-                "select": "keyword,volume,keyword_difficulty,best_position,best_position_diff,best_position_url",
+                "select": (
+                    "keyword,volume,keyword_difficulty,best_position,best_position_prev,"
+                    "best_position_diff,best_position_url"
+                ),
                 "limit": 1000,
             },
         )
@@ -1257,34 +1367,22 @@ class AhrefsClient:
 
     def get_dashboard_summary(self) -> dict[str, Any]:
         rankings = self.load_organic_rankings()
-        top10_count = 0
-        top30_count = 0
-        previous_top30_count = 0
-        for ranking in rankings.values():
-            position = ranking.get("best_position")
-            previous_position = ranking.get("best_position_prev")
-            if position is not None and position <= 10:
-                top10_count += 1
-            if position is not None and position <= 30:
-                top30_count += 1
-            if previous_position is not None and previous_position <= 30:
-                previous_top30_count += 1
-
+        bucket_summary = build_rank_bucket_summary(rankings)
         new_rd = self._get_refdomains_delta()
-        top30_change = calc_ratio_change(top30_count, previous_top30_count)
-        summary = {
-            "top10_count": top10_count,
-            "top30_count": top30_count,
-            "new_referring_domains": new_rd,
-            "top30_week_change": top30_change,
-        }
+        summary = {**bucket_summary, "new_referring_domains": new_rd}
         if self.report:
             self.report.log_api(
                 "Ahrefs",
                 "dashboard summary",
                 detail=(
-                    f"site={self.site_key} top10={top10_count} top30={top30_count} new_rd={new_rd} "
-                    f"top30_week_change={top30_change}"
+                    f"site={self.site_key} "
+                    f"top1_3={bucket_summary['top1_3']} top4_10={bucket_summary['top4_10']} "
+                    f"top11_20={bucket_summary['top11_20']} top21_100={bucket_summary['top21_100']} "
+                    f"new_rd={new_rd} "
+                    f"wow1_3={bucket_summary.get('top1_3_wow')} "
+                    f"wow4_10={bucket_summary.get('top4_10_wow')} "
+                    f"wow11_20={bucket_summary.get('top11_20_wow')} "
+                    f"wow21_100={bucket_summary.get('top21_100_wow')}"
                 ),
             )
         return summary
@@ -1354,6 +1452,52 @@ def calc_ratio_change(current: int, previous: int) -> float | None:
     if previous <= 0:
         return None
     return (current - previous) / previous
+
+
+def position_in_rank_bucket(position: Any, low: int, high: int) -> bool:
+    if position is None:
+        return False
+    try:
+        rank = int(position)
+    except (TypeError, ValueError):
+        return False
+    return low <= rank <= high
+
+
+def count_rank_buckets(
+    rankings: dict[str, dict[str, Any]],
+    *,
+    position_field: str = "best_position",
+) -> dict[str, int]:
+    counts = {key: 0 for _label, key, _lo, _hi in RANK_BUCKET_SPECS}
+    for ranking in rankings.values():
+        position = ranking.get(position_field)
+        for _label, key, low, high in RANK_BUCKET_SPECS:
+            if position_in_rank_bucket(position, low, high):
+                counts[key] += 1
+    return counts
+
+
+def build_rank_bucket_summary(rankings: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    current = count_rank_buckets(rankings, position_field="best_position")
+    previous = count_rank_buckets(rankings, position_field="best_position_prev")
+    summary: dict[str, Any] = dict(current)
+    for _label, key, _lo, _hi in RANK_BUCKET_SPECS:
+        wow = calc_ratio_change(current[key], previous[key])
+        summary[f"{key}_wow"] = wow
+    return summary
+
+
+def rank_bucket_logical_fields(ahrefs_summary: dict[str, Any]) -> dict[str, Any]:
+    """锚点日看板：四档词数 + 四档周环比（对比日为锚点-7）。"""
+    fields: dict[str, Any] = {}
+    for label, key, _lo, _hi in RANK_BUCKET_SPECS:
+        fields[label] = ahrefs_summary[key]
+        wow_label = RANK_BUCKET_WOW_LABELS[key]
+        wow_value = ahrefs_summary.get(f"{key}_wow")
+        if wow_value is not None:
+            fields[wow_label] = round(wow_value, 4)
+    return fields
 
 
 def build_dashboard_alert(traffic_week_change: float | None) -> str:
@@ -1664,8 +1808,7 @@ def sync_dashboard(
         if data_date == anchor:
             fields.update(
                 {
-                    "Top10词数": ahrefs_summary["top10_count"],
-                    "Top30词数": ahrefs_summary["top30_count"],
+                    **rank_bucket_logical_fields(ahrefs_summary),
                     "近7天RD变化": ahrefs_summary["new_referring_domains"],
                     "已监控URL收录数": page_stats.indexed_count,
                     "已监控URL异常数": page_stats.issues_count,
@@ -1674,8 +1817,6 @@ def sync_dashboard(
             )
             if traffic_week_change is not None:
                 fields["周环比流量"] = round(traffic_week_change, 4)
-            if ahrefs_summary["top30_week_change"] is not None:
-                fields["周环比Top30词"] = round(ahrefs_summary["top30_week_change"], 4)
 
         if is_provisional_gsc_zero(gsc_summary, data_date, config):
             report.log_warning(
@@ -1759,31 +1900,81 @@ def run_sync(
         report.log_skip("sync", "test-mingdao-only: skipped GSC/Ahrefs write")
         return report.save()
 
+    google_credentials: Any | None = None
+    try:
+        google_credentials = load_google_credentials_with_retry(config)
+        logging.info(
+            "Google credentials ready (auth=%s); reused for all %s site(s)",
+            config.google_auth_mode,
+            len(config.sites),
+        )
+    except Exception as exc:
+        report.log_warning(f"Google credentials unavailable, GSC steps will retry per site: {exc}")
+        logging.exception("Google credentials load failed")
+
     for site in config.sites:
         logging.info("Syncing site: %s (GSC=%s, Ahrefs=%s)", site.key, site.gsc_site_url, site.ahrefs_domain)
-        try:
-            gsc = GSCClient(config, report, site_url=site.gsc_site_url)
-            ahrefs = AhrefsClient(
-                config,
-                report,
-                target_domain=site.ahrefs_domain,
-                site_key=site.key,
-                report_date=anchor,
-            )
-            sync_site(
-                config,
-                mingdao,
-                gsc,
-                ahrefs,
-                report,
-                site,
-                cache,
-                tables=tables,
-                force_refresh=force_refresh,
-            )
-        except Exception as exc:
-            report.log_warning(f"{site.key} sync failed: {exc}")
-            logging.exception("Site sync failed: %s", site.key)
+        site_ok = False
+        last_error: Exception | None = None
+        for attempt in range(1, SITE_SYNC_MAX_ATTEMPTS + 1):
+            try:
+                gsc = GSCClient(
+                    config,
+                    report,
+                    site_url=site.gsc_site_url,
+                    credentials=google_credentials,
+                )
+                ahrefs = AhrefsClient(
+                    config,
+                    report,
+                    target_domain=site.ahrefs_domain,
+                    site_key=site.key,
+                    report_date=anchor,
+                )
+                sync_site(
+                    config,
+                    mingdao,
+                    gsc,
+                    ahrefs,
+                    report,
+                    site,
+                    cache,
+                    tables=tables,
+                    force_refresh=force_refresh,
+                )
+                site_ok = True
+                if attempt > 1:
+                    logging.info("%s sync succeeded on attempt %s/%s", site.key, attempt, SITE_SYNC_MAX_ATTEMPTS)
+                break
+            except Exception as exc:
+                last_error = exc
+                if is_transient_network_error(exc) and attempt < SITE_SYNC_MAX_ATTEMPTS:
+                    delay = SITE_SYNC_RETRY_SECONDS * attempt
+                    logging.warning(
+                        "%s sync failed (attempt %s/%s), retry in %ss: %s",
+                        site.key,
+                        attempt,
+                        SITE_SYNC_MAX_ATTEMPTS,
+                        delay,
+                        exc,
+                    )
+                    report.log_warning(
+                        f"{site.key} transient error (attempt {attempt}/{SITE_SYNC_MAX_ATTEMPTS}), "
+                        f"retry in {delay}s: {exc}"
+                    )
+                    if google_credentials is None and config.google_auth_mode == "oauth":
+                        try:
+                            google_credentials = load_google_credentials_with_retry(config)
+                            logging.info("Google credentials reloaded after transient failure")
+                        except Exception as cred_exc:
+                            logging.warning("Google credentials reload failed: %s", cred_exc)
+                    time.sleep(delay)
+                    continue
+                report.log_warning(f"{site.key} sync failed: {exc}")
+                logging.exception("Site sync failed: %s", site.key)
+                break
+        if not site_ok and last_error is not None:
+            logging.error("%s skipped after %s attempt(s)", site.key, SITE_SYNC_MAX_ATTEMPTS)
 
     report_path = report.save()
     logging.info("SEO Mingdao data sync finished. Report: %s", report_path)

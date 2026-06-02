@@ -15,6 +15,7 @@
 | **Missing MINGDAO_APP_KEY** | 明道云 | 未填 AppKey / Sign | ✅ 填好后正常 |
 | **OAuth 验证失败** | Google | 测试用户未加或登录 Gmail 不一致 | ✅ 加测试用户即可 |
 | **Top10/Top30 = 0** | Ahrefs | US 区该站可能无词进前 30，不一定是 bug | ℹ️ 对照 Ahrefs 网页 |
+| **仅最后一站成功** | GSC OAuth 443 | 旧版每站重复刷新 token；现版已 **共用凭据 + 整站重试 3 次** | 仍失败则查 Clash，再跑 `run_sync.bat` |
 
 ## 推荐配置
 
