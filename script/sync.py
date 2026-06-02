@@ -1,7 +1,8 @@
 """
 SEO sync: pull GSC + Ahrefs and write to Mingdao worksheets.
 
-Phase 1: SEO automatic dashboard only. Run via run_sync.bat (about once per week).
+Run via run_sync.bat (about once per week).
+Writes: SEO 自动数据看板、站点关键词库、页面管理表、外链监控表。
 """
 from __future__ import annotations
 
@@ -36,8 +37,10 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT / "logs"
 REPORT_DIR = ROOT / "reports"
+CACHE_DIR = ROOT / "cache"
 OPTIONS_FILE = ROOT / "config" / "mingdao_options.json"
 SITES_FILE = ROOT / "config" / "sites.json"
+WORKSHEETS_FILE = ROOT / "config" / "mingdao_worksheets.json"
 LOG_DIR.mkdir(exist_ok=True)
 REPORT_DIR.mkdir(exist_ok=True)
 
@@ -91,6 +94,9 @@ def get_mingdao_proxies() -> dict[str, str]:
 apply_proxy_env()
 
 DASHBOARD_LABEL = "SEO自动数据看板"
+KEYWORDS_LABEL = "站点关键词库"
+PAGES_LABEL = "页面管理表"
+BACKLINKS_LABEL = "外链监控表"
 
 
 @dataclass
@@ -147,7 +153,8 @@ class SyncReport:
             "=" * 60,
             f"Started : {self.started_at.isoformat(sep=' ', timespec='seconds')}",
             f"Finished: {finished_at.isoformat(sep=' ', timespec='seconds')}",
-            f"Data date: {self.data_date.isoformat()} (today - DATA_DELAY_DAYS={self.config.data_delay_days})",
+            f"Anchor date : {self.data_date.isoformat()} (today - DATA_DELAY_DAYS={self.config.data_delay_days})",
+            f"Dashboard   : {self.config.dashboard_sync_days} days ending on anchor",
             f"Sites     : {', '.join(site.key for site in self.config.sites)}",
             "",
             f"API calls ({len(self.api_calls)})",
@@ -214,6 +221,37 @@ class SiteConfig:
 
 
 @dataclass(frozen=True)
+class WorksheetTableConfig:
+    worksheet_id: str
+    fields: dict[str, str]
+    site_option_keys: dict[str, str]
+    option_keys: dict[str, dict[str, str]]
+
+
+@dataclass(frozen=True)
+class WorksheetsConfig:
+    keywords: WorksheetTableConfig
+    pages: WorksheetTableConfig
+    backlinks: WorksheetTableConfig
+
+
+@dataclass
+class PageSyncStats:
+    indexed_count: int = 0
+    issues_count: int = 0
+    updated: int = 0
+    skipped_empty_url: int = 0
+
+
+@dataclass
+class SyncTables:
+    keywords: bool = True
+    pages: bool = True
+    backlinks: bool = True
+    dashboard: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     mingdao_app_key: str
     mingdao_sign: str
@@ -229,7 +267,15 @@ class Config:
     google_token_file: str
     ahrefs_api_token: str
     ahrefs_target_country: str
+    ahrefs_aggregate_countries: tuple[str, ...]
+    ahrefs_aggregate_max_countries: int
+    ahrefs_backlinks_limit: int
+    worksheets: WorksheetsConfig
     data_delay_days: int
+    dashboard_sync_days: int
+    cache_enabled: bool
+    cache_ttl_hours: int
+    gsc_recent_refresh_days: int
 
     @classmethod
     def load(cls, *, site_filter: list[str] | None = None) -> "Config":
@@ -268,8 +314,18 @@ class Config:
             google_client_secret_file=os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json"),
             google_token_file=os.getenv("GOOGLE_TOKEN_FILE", "token.json"),
             ahrefs_api_token=env_required("AHREFS_API_TOKEN"),
-            ahrefs_target_country=os.getenv("AHREFS_TARGET_COUNTRY", "us"),
-            data_delay_days=int(os.getenv("DATA_DELAY_DAYS", "2")),
+            ahrefs_target_country=os.getenv("AHREFS_TARGET_COUNTRY", "us").strip().lower(),
+            ahrefs_aggregate_countries=tuple(
+                parse_country_list(os.getenv("AHREFS_AGGREGATE_COUNTRIES", ""))
+            ),
+            ahrefs_aggregate_max_countries=int(os.getenv("AHREFS_AGGREGATE_MAX_COUNTRIES", "0")),
+            ahrefs_backlinks_limit=int(os.getenv("AHREFS_BACKLINKS_LIMIT", "500")),
+            worksheets=load_worksheets_config(),
+            data_delay_days=int(os.getenv("DATA_DELAY_DAYS", "3")),
+            dashboard_sync_days=int(os.getenv("DASHBOARD_SYNC_DAYS", "7")),
+            cache_enabled=os.getenv("CACHE_ENABLED", "1").lower() not in {"0", "false", "no", "off"},
+            cache_ttl_hours=int(os.getenv("CACHE_TTL_HOURS", "12")),
+            gsc_recent_refresh_days=int(os.getenv("GSC_RECENT_REFRESH_DAYS", "2")),
         )
 
     def site_option_key(self, site_key: str) -> str:
@@ -294,13 +350,122 @@ def load_mingdao_options() -> dict[str, dict[str, str]]:
     return {"sites": payload["sites"], "alerts": payload["alerts"]}
 
 
-def normalize_gsc_site_url(value: str) -> str:
-    raw = value.strip()
+def load_worksheet_table(raw: dict[str, Any]) -> WorksheetTableConfig:
+    option_keys: dict[str, dict[str, str]] = {}
+    for key in ("index_status_option_keys", "dofollow_option_keys", "link_status_option_keys"):
+        if key in raw:
+            option_keys[key.removesuffix("_option_keys")] = dict(raw[key])
+    return WorksheetTableConfig(
+        worksheet_id=str(raw["worksheet_id"]),
+        fields=dict(raw["fields"]),
+        site_option_keys=dict(raw["site_option_keys"]),
+        option_keys=option_keys,
+    )
+
+
+def load_worksheets_config() -> WorksheetsConfig:
+    if not WORKSHEETS_FILE.exists():
+        raise RuntimeError(f"Missing {WORKSHEETS_FILE}")
+    payload = json.loads(WORKSHEETS_FILE.read_text(encoding="utf-8"))
+    return WorksheetsConfig(
+        keywords=load_worksheet_table(payload["keywords"]),
+        pages=load_worksheet_table(payload["pages"]),
+        backlinks=load_worksheet_table(payload["backlinks"]),
+    )
+
+
+def worksheet_site_option(table: WorksheetTableConfig, site_key: str) -> str:
+    key = table.site_option_keys.get(site_key)
+    if not key:
+        known = ", ".join(sorted(table.site_option_keys))
+        raise RuntimeError(f"Unknown site {site_key!r} in worksheet config. Known: {known}")
+    return key
+
+
+def row_control_value(row: dict[str, Any], control_id: str) -> str:
+    value = row.get(control_id, "")
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def build_site_filter(control_id: str, site_option_key: str) -> dict[str, Any]:
+    return {
+        "controlId": control_id,
+        "dataType": MingdaoClient.SELECT_TYPE,
+        "spliceType": 1,
+        "filterType": 2,
+        "values": [site_option_key],
+    }
+
+
+def format_rank_change(item: dict[str, Any]) -> str:
+    position = item.get("best_position")
+    diff = item.get("best_position_diff")
+    if position is None:
+        return "未进Top100"
+    if diff is None or diff == 0:
+        return "持平"
+    diff_int = int(diff)
+    if diff_int < 0:
+        return f"↑{abs(diff_int)}"
+    return f"↓{diff_int}"
+
+
+def map_gsc_index_status(payload: dict[str, Any]) -> str:
+    index = payload.get("inspectionResult", {}).get("indexStatusResult", {})
+    verdict = str(index.get("verdict", "")).upper()
+    coverage = str(index.get("coverageState", "")).lower()
+    if verdict == "PASS" or "indexed" in coverage:
+        return "已收录"
+    if verdict in {"FAIL", "PARTIAL"} or "error" in coverage or "redirect" in coverage:
+        return "索引异常"
+    return "未收录"
+
+
+def extract_domain_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    return host.removeprefix("www.")
+
+
+def parse_ahrefs_date(value: Any) -> str | None:
+    if not value:
+        return None
+    text = str(value)
+    if "T" in text:
+        return text.split("T", 1)[0]
+    return text[:10] if len(text) >= 10 else text
+
+
+def normalize_page_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+def normalize_page_url_for_gsc(url: str) -> str:
+    """GSC URL Inspection / 页面维度查询需要完整 https URL。"""
+    raw = url.strip()
     if not raw:
         return ""
     if not raw.startswith("http://") and not raw.startswith("https://"):
         raw = f"https://{raw}"
+    return raw.rstrip("/") + "/"
+
+
+def normalize_gsc_site_url(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    if raw.startswith("sc-domain:"):
+        return raw
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = f"https://{raw}"
     return raw
+
+
+def parse_country_list(value: str) -> list[str]:
+    return [part.strip().lower() for part in value.split(",") if part.strip()]
 
 
 def load_sites(site_filter: list[str] | None = None) -> list[SiteConfig]:
@@ -324,6 +489,18 @@ def load_sites(site_filter: list[str] | None = None) -> list[SiteConfig]:
     return sites
 
 
+def merge_organic_ranking(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    existing_pos = existing.get("best_position")
+    incoming_pos = incoming.get("best_position")
+    if existing_pos is None:
+        return incoming
+    if incoming_pos is None:
+        return existing
+    if incoming_pos < existing_pos:
+        return incoming
+    return existing
+
+
 def env_required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -342,8 +519,137 @@ def normalize_ahrefs_domain(value: str) -> str:
     return host.lower().removeprefix("www.")
 
 
-def get_target_date(config: Config) -> dt.date:
+def get_sync_anchor_date(config: Config) -> dt.date:
+    """GSC 数据可用性锚点：today - DATA_DELAY_DAYS（建议 3，覆盖 1–3 天延迟）。"""
     return dt.date.today() - dt.timedelta(days=config.data_delay_days)
+
+
+def get_target_date(config: Config) -> dt.date:
+    return get_sync_anchor_date(config)
+
+
+def get_dashboard_dates(config: Config) -> list[dt.date]:
+    anchor = get_sync_anchor_date(config)
+    start = anchor - dt.timedelta(days=config.dashboard_sync_days - 1)
+    dates: list[dt.date] = []
+    current = start
+    while current <= anchor:
+        dates.append(current)
+        current += dt.timedelta(days=1)
+    return dates
+
+
+def empty_gsc_summary() -> dict[str, Any]:
+    return {"clicks": 0, "impressions": 0, "ctr": 0.0, "position": 0.0}
+
+
+def is_provisional_gsc_zero(summary: dict[str, Any], date_value: dt.date, config: Config) -> bool:
+    """ clicks/impressions 均为 0 且日期仍在 GSC 可能补数的窗口内 → 下次 sync 应重拉。"""
+    clicks = int(summary.get("clicks") or 0)
+    impressions = int(summary.get("impressions") or 0)
+    if clicks > 0 or impressions > 0:
+        return False
+    days_since = (dt.date.today() - date_value).days
+    return days_since <= config.data_delay_days + config.gsc_recent_refresh_days
+
+
+class SyncCache:
+    """本地 JSON 缓存：避免重复 GSC 请求；对仍为 0 的近期日期自动失效。"""
+
+    def __init__(self, *, enabled: bool = True):
+        self.enabled = enabled
+        self.gsc_dir = CACHE_DIR / "gsc"
+        if enabled:
+            self.gsc_dir.mkdir(parents=True, exist_ok=True)
+
+    def _gsc_path(self, site_key: str) -> Path:
+        return self.gsc_dir / f"{site_key}.json"
+
+    def load_gsc_site(self, site_key: str) -> dict[str, Any]:
+        if not self.enabled:
+            return {"days": {}}
+        path = self._gsc_path(site_key)
+        if not path.exists():
+            return {"days": {}}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def save_gsc_site(self, site_key: str, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self._gsc_path(site_key).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def get_gsc_day(self, site_key: str, date_value: dt.date) -> dict[str, Any] | None:
+        return self.load_gsc_site(site_key).get("days", {}).get(date_value.isoformat())
+
+    def merge_gsc_days(self, site_key: str, days: dict[str, dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
+        payload = self.load_gsc_site(site_key)
+        payload.setdefault("days", {}).update(days)
+        payload["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        self.save_gsc_site(site_key, payload)
+
+    def needs_gsc_fetch(
+        self,
+        site_key: str,
+        date_value: dt.date,
+        config: Config,
+        *,
+        force: bool,
+    ) -> bool:
+        if force or not self.enabled:
+            return True
+        cached = self.get_gsc_day(site_key, date_value)
+        if cached is None:
+            return True
+        if is_provisional_gsc_zero(cached, date_value, config):
+            return True
+        fetched_at = cached.get("fetched_at", "")
+        if not fetched_at:
+            return True
+        try:
+            ts = dt.datetime.fromisoformat(fetched_at)
+        except ValueError:
+            return True
+        age_hours = (dt.datetime.now() - ts).total_seconds() / 3600
+        return age_hours >= config.cache_ttl_hours
+
+
+def fetch_gsc_daily_summaries(
+    gsc: "GSCClient",
+    site: SiteConfig,
+    config: Config,
+    cache: SyncCache,
+    report: SyncReport,
+    *,
+    force_refresh: bool = False,
+) -> dict[dt.date, dict[str, Any]]:
+    dates = get_dashboard_dates(config)
+    start, end = dates[0], dates[-1]
+    needs_fetch = any(
+        cache.needs_gsc_fetch(site.key, day, config, force=force_refresh) for day in dates
+    )
+
+    if needs_fetch:
+        batch = gsc.query_daily_summaries(start, end)
+        fetched_at = dt.datetime.now().isoformat(timespec="seconds")
+        to_save: dict[str, dict[str, Any]] = {}
+        for day in dates:
+            summary = batch.get(day, empty_gsc_summary())
+            to_save[day.isoformat()] = {**summary, "fetched_at": fetched_at}
+        cache.merge_gsc_days(site.key, to_save)
+        report.log_api("cache", "gsc refresh", detail=f"site={site.key} range={start}..{end} days={len(dates)}")
+    else:
+        report.log_api("cache", "gsc hit", detail=f"site={site.key} range={start}..{end}")
+
+    result: dict[dt.date, dict[str, Any]] = {}
+    for day in dates:
+        cached = cache.get_gsc_day(site.key, day)
+        result[day] = cached if cached else empty_gsc_summary()
+    return result
 
 
 class MingdaoClient:
@@ -392,11 +698,13 @@ class MingdaoClient:
         *,
         filters: list[dict[str, Any]] | None = None,
         page_size: int = 100,
+        page_index: int = 1,
+        log_api: bool = True,
     ) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "worksheetId": worksheet_id,
             "pageSize": page_size,
-            "pageIndex": 1,
+            "pageIndex": page_index,
             "listType": 0,
         }
         if filters:
@@ -404,13 +712,38 @@ class MingdaoClient:
 
         data = self._post("getFilterRows", payload)
         rows = data.get("data", {}).get("rows", [])
-        if self.report:
+        if self.report and log_api:
             self.report.log_api(
                 "Mingdao",
                 "getFilterRows",
-                detail=f"worksheet={worksheet_id} rows={len(rows)}",
+                detail=f"worksheet={worksheet_id} page={page_index} rows={len(rows)}",
             )
         return rows
+
+    def list_all_rows(
+        self,
+        worksheet_id: str,
+        *,
+        filters: list[dict[str, Any]] | None = None,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        all_rows: list[dict[str, Any]] = []
+        page_index = 1
+        while True:
+            rows = self.list_rows(
+                worksheet_id,
+                filters=filters,
+                page_size=page_size,
+                page_index=page_index,
+                log_api=page_index == 1,
+            )
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if len(rows) < page_size:
+                break
+            page_index += 1
+        return all_rows
 
     def find_dashboard_row(self, data_date: dt.date, site_option_key: str) -> dict[str, Any] | None:
         fields = self.config.dashboard_fields
@@ -419,7 +752,7 @@ class MingdaoClient:
                 "controlId": fields.date,
                 "dataType": self.DATE_TYPE,
                 "spliceType": 1,
-                "filterType": 17,
+                "filterType": 2,
                 "value": data_date.isoformat(),
             },
             {
@@ -645,6 +978,41 @@ class GSCClient:
             )
         return summary
 
+    def query_daily_summaries(
+        self,
+        start_date: dt.date,
+        end_date: dt.date,
+    ) -> dict[dt.date, dict[str, Any]]:
+        body = {
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "dimensions": ["date"],
+            "rowLimit": 25000,
+        }
+        result = self._query_search_analytics(body)
+        by_date: dict[dt.date, dict[str, Any]] = {}
+        for row in result.get("rows", []):
+            keys = row.get("keys", [])
+            if not keys:
+                continue
+            day = dt.date.fromisoformat(str(keys[0]))
+            by_date[day] = {
+                "clicks": int(row.get("clicks", 0)),
+                "impressions": int(row.get("impressions", 0)),
+                "ctr": float(row.get("ctr", 0)),
+                "position": float(row.get("position", 0)),
+            }
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                "searchAnalytics/query (daily batch)",
+                detail=(
+                    f"site={self.site_url} range={start_date.isoformat()}..{end_date.isoformat()} "
+                    f"days={len(by_date)}"
+                ),
+            )
+        return by_date
+
     def query_clicks_sum(self, start_date: dt.date, end_date: dt.date) -> int:
         body = {
             "startDate": start_date.isoformat(),
@@ -661,6 +1029,68 @@ class GSCClient:
                 detail=f"site={self.site_url} range={start_date.isoformat()}..{end_date.isoformat()} clicks={clicks}",
             )
         return clicks
+
+    def query_page_clicks(self, page_url: str, date_value: dt.date) -> int:
+        body = {
+            "startDate": date_value.isoformat(),
+            "endDate": date_value.isoformat(),
+            "dimensions": ["page"],
+            "dimensionFilterGroups": [
+                {
+                    "filters": [
+                        {
+                            "dimension": "page",
+                            "operator": "equals",
+                            "expression": page_url,
+                        }
+                    ]
+                }
+            ],
+            "rowLimit": 1,
+        }
+        result = self._query_search_analytics(body)
+        rows = result.get("rows", [])
+        clicks = int(rows[0].get("clicks", 0)) if rows else 0
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                "searchAnalytics/query (page clicks)",
+                detail=f"site={self.site_url} page={page_url} date={date_value.isoformat()} clicks={clicks}",
+            )
+        return clicks
+
+    def inspect_page_url(self, page_url: str) -> str:
+        url = "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect"
+        body = {"inspectionUrl": page_url, "siteUrl": self.site_url}
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                response = self.session.post(url, json=body, timeout=self.REQUEST_TIMEOUT)
+                if response.status_code == 403:
+                    self._raise_gsc_permission_error(response)
+                response.raise_for_status()
+                payload = response.json()
+                status = map_gsc_index_status(payload)
+                if self.report:
+                    self.report.log_api(
+                        "GSC",
+                        "urlInspection/index:inspect",
+                        detail=f"site={self.site_url} page={page_url} status={status}",
+                    )
+                return status
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                logging.warning(
+                    "GSC URL inspection failed (attempt %s/%s): %s",
+                    attempt,
+                    self.MAX_RETRIES,
+                    exc,
+                )
+                if attempt < self.MAX_RETRIES:
+                    time.sleep(2)
+
+        raise RuntimeError(f"GSC URL Inspection 失败: {page_url}. {last_error}") from last_error
 
     def _query_search_analytics(self, body: dict[str, Any]) -> dict[str, Any]:
         encoded_site = quote(self.site_url, safe="")
@@ -704,7 +1134,8 @@ class GSCClient:
             ) from None
         raise RuntimeError(
             "Google Search Console 返回 403。"
-            f"请确认 GSC_SITE_URL 与 Search Console 资源一致。详情: {message}"
+            f"请确认 config/sites.json 中该站的 gsc_site_url 与 Search Console 资源完全一致"
+            f"（URL 前缀或 sc-domain:xxx.com）。详情: {message}"
         ) from None
 
 
@@ -718,6 +1149,7 @@ class AhrefsClient:
         *,
         target_domain: str,
         site_key: str = "",
+        report_date: dt.date | None = None,
     ):
         self.config = config
         self.report = report
@@ -730,7 +1162,7 @@ class AhrefsClient:
                 "Accept": "application/json",
             }
         )
-        self.report_date = get_target_date(config)
+        self.report_date = report_date or get_sync_anchor_date(config)
         self.compare_date = self.report_date - dt.timedelta(days=7)
         self._organic_rankings: dict[str, dict[str, Any]] | None = None
 
@@ -738,14 +1170,37 @@ class AhrefsClient:
         if self._organic_rankings is not None:
             return self._organic_rankings
 
+        if self._is_aggregate_all():
+            rankings, countries = self._load_organic_rankings_all_countries()
+            detail = (
+                f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} "
+                f"countries={len(countries)} count={len(rankings)} mode=aggregate"
+            )
+        else:
+            rankings = self._load_organic_rankings_for_country(self.config.ahrefs_target_country)
+            detail = (
+                f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} "
+                f"country={self.config.ahrefs_target_country} count={len(rankings)}"
+            )
+
+        self._organic_rankings = rankings
+        logging.info("Loaded %s organic keywords from Ahrefs", len(rankings))
+        if self.report:
+            self.report.log_api("Ahrefs", "site-explorer/organic-keywords", detail=detail)
+        return rankings
+
+    def _is_aggregate_all(self) -> bool:
+        return self.config.ahrefs_target_country == "all"
+
+    def _load_organic_rankings_for_country(self, country: str) -> dict[str, dict[str, Any]]:
         payload = self._request(
             "site-explorer/organic-keywords",
             {
                 "target": self.target_domain,
-                "country": self.config.ahrefs_target_country.lower(),
+                "country": country.lower(),
                 "date": self.report_date.isoformat(),
                 "date_compared": self.compare_date.isoformat(),
-                "select": "keyword,volume,keyword_difficulty,best_position,best_position_diff",
+                "select": "keyword,volume,keyword_difficulty,best_position,best_position_diff,best_position_url",
                 "limit": 1000,
             },
         )
@@ -754,15 +1209,51 @@ class AhrefsClient:
             keyword = item.get("keyword")
             if keyword:
                 rankings[str(keyword).casefold()] = item
-        self._organic_rankings = rankings
-        logging.info("Loaded %s organic keywords from Ahrefs", len(rankings))
-        if self.report:
-            self.report.log_api(
-                "Ahrefs",
-                "site-explorer/organic-keywords",
-                detail=f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} count={len(rankings)}",
-            )
         return rankings
+
+    def _resolve_aggregate_countries(self) -> list[str]:
+        if self.config.ahrefs_aggregate_countries:
+            return list(self.config.ahrefs_aggregate_countries)
+
+        payload = self._request(
+            "site-explorer/metrics-by-country",
+            {
+                "target": self.target_domain,
+                "date": self.report_date.isoformat(),
+                "select": "country,org_keywords,org_traffic",
+            },
+        )
+        rows = [row for row in payload.get("metrics", []) if (row.get("org_keywords") or 0) > 0]
+        rows.sort(key=lambda row: (row.get("org_traffic") or 0), reverse=True)
+        max_countries = self.config.ahrefs_aggregate_max_countries
+        if max_countries > 0:
+            rows = rows[:max_countries]
+        countries = [str(row["country"]).lower() for row in rows]
+        if not countries:
+            logging.warning(
+                "Ahrefs aggregate: no countries with organic keywords for %s; fallback to us",
+                self.target_domain,
+            )
+            return ["us"]
+        logging.info(
+            "Ahrefs aggregate countries for %s: %s",
+            self.target_domain,
+            ",".join(countries),
+        )
+        return countries
+
+    def _load_organic_rankings_all_countries(self) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        countries = self._resolve_aggregate_countries()
+        merged: dict[str, dict[str, Any]] = {}
+        for country in countries:
+            country_rankings = self._load_organic_rankings_for_country(country)
+            for key, item in country_rankings.items():
+                existing = merged.get(key)
+                if existing is None:
+                    merged[key] = item
+                else:
+                    merged[key] = merge_organic_ranking(existing, item)
+        return merged, countries
 
     def get_dashboard_summary(self) -> dict[str, Any]:
         rankings = self.load_organic_rankings()
@@ -822,6 +1313,31 @@ class AhrefsClient:
             )
         return delta
 
+    def load_backlinks(self) -> list[dict[str, Any]]:
+        payload = self._request(
+            "site-explorer/all-backlinks",
+            {
+                "target": self.target_domain,
+                "select": (
+                    "url_from,url_to,anchor,domain_rating_source,is_dofollow,first_seen,is_lost"
+                ),
+                "limit": self.config.ahrefs_backlinks_limit,
+                "history": "live",
+                "aggregation": "1_per_domain",
+            },
+        )
+        backlinks = payload.get("backlinks", [])
+        if self.report:
+            self.report.log_api(
+                "Ahrefs",
+                "site-explorer/all-backlinks",
+                detail=(
+                    f"site={self.site_key} target={self.target_domain} "
+                    f"count={len(backlinks)} limit={self.config.ahrefs_backlinks_limit}"
+                ),
+            )
+        return backlinks
+
     def _request(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.BASE_URL}/{path.lstrip('/')}"
         resp = self.session.get(url, params=params, timeout=60)
@@ -846,6 +1362,269 @@ def build_dashboard_alert(traffic_week_change: float | None) -> str:
     return "正常"
 
 
+def build_keyword_controls(
+    table: WorksheetTableConfig,
+    *,
+    site_option_key: str,
+    data_date: dt.date,
+    keyword: str,
+    item: dict[str, Any],
+) -> list[dict[str, str]]:
+    fields = table.fields
+    controls = [
+        {"controlId": fields["site"], "value": site_option_key},
+        {"controlId": fields["keyword"], "value": keyword},
+        {"controlId": fields["data_date"], "value": format_mingdao_date(data_date)},
+        {"controlId": fields["rank_change"], "value": format_rank_change(item)},
+    ]
+    volume = item.get("volume")
+    if volume is not None:
+        controls.append({"controlId": fields["volume"], "value": format_mingdao_number(volume)})
+    kd = item.get("keyword_difficulty")
+    if kd is not None:
+        controls.append({"controlId": fields["kd"], "value": format_mingdao_number(kd)})
+    rank = item.get("best_position")
+    if rank is not None:
+        controls.append({"controlId": fields["rank"], "value": format_mingdao_number(rank)})
+    landing = item.get("best_position_url")
+    if landing:
+        controls.append({"controlId": fields["landing_url"], "value": str(landing)})
+    return controls
+
+
+def build_page_controls(
+    table: WorksheetTableConfig,
+    *,
+    data_date: dt.date,
+    index_status: str,
+    traffic: int,
+) -> list[dict[str, str]]:
+    fields = table.fields
+    index_keys = table.option_keys.get("index_status", {})
+    index_key = index_keys.get(index_status)
+    if not index_key:
+        raise RuntimeError(f"Unknown index status {index_status!r}")
+    return [
+        {"controlId": fields["index_status"], "value": index_key},
+        {"controlId": fields["traffic"], "value": format_mingdao_number(traffic)},
+        {"controlId": fields["data_date"], "value": format_mingdao_date(data_date)},
+    ]
+
+
+def build_backlink_controls(
+    table: WorksheetTableConfig,
+    *,
+    site_option_key: str,
+    data_date: dt.date,
+    item: dict[str, Any],
+) -> list[dict[str, str]]:
+    fields = table.fields
+    dofollow_keys = table.option_keys.get("dofollow", {})
+    status_keys = table.option_keys.get("link_status", {})
+    source_url = str(item.get("url_from") or "")
+    target_url = str(item.get("url_to") or "")
+    is_dofollow = item.get("is_dofollow")
+    dofollow_label = "是" if is_dofollow else "否"
+    link_status = "已失效" if item.get("is_lost") else "有效"
+    controls = [
+        {"controlId": fields["site"], "value": site_option_key},
+        {"controlId": fields["source_domain"], "value": extract_domain_from_url(source_url)},
+        {"controlId": fields["source_url"], "value": source_url},
+        {"controlId": fields["target_url"], "value": target_url},
+        {"controlId": fields["data_date"], "value": format_mingdao_date(data_date)},
+        {"controlId": fields["is_dofollow"], "value": dofollow_keys[dofollow_label]},
+        {"controlId": fields["link_status"], "value": status_keys[link_status]},
+    ]
+    anchor = item.get("anchor")
+    if anchor:
+        controls.append({"controlId": fields["anchor"], "value": str(anchor)})
+    dr = item.get("domain_rating_source")
+    if dr is not None:
+        controls.append({"controlId": fields["domain_dr"], "value": format_mingdao_number(dr)})
+    first_seen = parse_ahrefs_date(item.get("first_seen"))
+    if first_seen:
+        controls.append({"controlId": fields["first_seen"], "value": first_seen})
+    return controls
+
+
+def sync_keywords(
+    config: Config,
+    mingdao: MingdaoClient,
+    ahrefs: AhrefsClient,
+    report: SyncReport,
+    site: SiteConfig,
+    data_date: dt.date,
+) -> None:
+    table = config.worksheets.keywords
+    site_option = worksheet_site_option(table, site.key)
+    rankings = ahrefs.load_organic_rankings()
+    filters = [build_site_filter(table.fields["site"], site_option)]
+    existing_rows = mingdao.list_all_rows(table.worksheet_id, filters=filters)
+    row_index = {
+        row_control_value(row, table.fields["keyword"]).casefold(): row["rowid"]
+        for row in existing_rows
+        if row_control_value(row, table.fields["keyword"])
+    }
+
+    created = 0
+    updated = 0
+    for item in rankings.values():
+        keyword = item.get("keyword")
+        if not keyword:
+            continue
+        keyword_text = str(keyword)
+        controls = build_keyword_controls(
+            table,
+            site_option_key=site_option,
+            data_date=data_date,
+            keyword=keyword_text,
+            item=item,
+        )
+        lookup = keyword_text.casefold()
+        row_id = row_index.get(lookup)
+        if row_id:
+            mingdao.edit_row(table.worksheet_id, row_id, controls)
+            updated += 1
+        else:
+            mingdao.add_row(table.worksheet_id, controls)
+            created += 1
+
+    report.log_api(
+        "sync",
+        f"keywords ({site.key})",
+        detail=f"created={created} updated={updated} total={len(rankings)}",
+    )
+    if not rankings:
+        report.log_skip(
+            KEYWORDS_LABEL,
+            f"{site.key} Ahrefs US 市场 date={data_date} 返回 0 条排名词（站点在美国 Google 可能暂无 Top100 词）",
+        )
+    report.log_write(
+        KEYWORDS_LABEL,
+        "sync",
+        site.key,
+        {"新建": created, "更新": updated, "API词数": len(rankings)},
+    )
+
+
+def sync_pages(
+    config: Config,
+    mingdao: MingdaoClient,
+    gsc: GSCClient,
+    report: SyncReport,
+    site: SiteConfig,
+    data_date: dt.date,
+) -> PageSyncStats:
+    table = config.worksheets.pages
+    site_option = worksheet_site_option(table, site.key)
+    filters = [build_site_filter(table.fields["site"], site_option)]
+    rows = mingdao.list_all_rows(table.worksheet_id, filters=filters)
+    stats = PageSyncStats()
+
+    for row in rows:
+        page_url = row_control_value(row, table.fields["page_url"])
+        if not page_url:
+            stats.skipped_empty_url += 1
+            report.log_skip(PAGES_LABEL, f"{site.key} 空页面URL rowId={row.get('rowid')}")
+            continue
+
+        gsc_url = normalize_page_url_for_gsc(page_url)
+        if gsc_url != page_url and gsc_url.rstrip("/") != page_url.rstrip("/"):
+            report.log_api(
+                "sync",
+                f"page url normalized ({site.key})",
+                detail=f"{page_url!r} -> {gsc_url!r}",
+            )
+
+        traffic = gsc.query_page_clicks(gsc_url, data_date)
+        index_status = gsc.inspect_page_url(gsc_url)
+        controls = build_page_controls(
+            table,
+            data_date=data_date,
+            index_status=index_status,
+            traffic=traffic,
+        )
+        mingdao.edit_row(table.worksheet_id, row["rowid"], controls)
+        stats.updated += 1
+        if index_status == "已收录":
+            stats.indexed_count += 1
+        else:
+            stats.issues_count += 1
+        report.log_write(
+            PAGES_LABEL,
+            "update",
+            normalize_page_url(page_url),
+            {"收录状态": index_status, "页面流量": traffic},
+        )
+
+    if not rows:
+        report.log_skip(PAGES_LABEL, f"{site.key} 页面表无行，请先在明道云录入页面URL")
+    report.log_api(
+        "sync",
+        f"pages ({site.key})",
+        detail=(
+            f"updated={stats.updated} indexed={stats.indexed_count} "
+            f"issues={stats.issues_count} skipped_empty={stats.skipped_empty_url}"
+        ),
+    )
+    return stats
+
+
+def sync_backlinks(
+    config: Config,
+    mingdao: MingdaoClient,
+    ahrefs: AhrefsClient,
+    report: SyncReport,
+    site: SiteConfig,
+    data_date: dt.date,
+) -> None:
+    table = config.worksheets.backlinks
+    site_option = worksheet_site_option(table, site.key)
+    backlinks = ahrefs.load_backlinks()
+    filters = [build_site_filter(table.fields["site"], site_option)]
+    existing_rows = mingdao.list_all_rows(table.worksheet_id, filters=filters)
+    row_index: dict[tuple[str, str], str] = {}
+    for row in existing_rows:
+        source_url = normalize_page_url(row_control_value(row, table.fields["source_url"]))
+        target_url = normalize_page_url(row_control_value(row, table.fields["target_url"]))
+        if source_url and target_url:
+            row_index[(source_url, target_url)] = row["rowid"]
+
+    created = 0
+    updated = 0
+    for item in backlinks:
+        source_url = str(item.get("url_from") or "").strip()
+        target_url = str(item.get("url_to") or "").strip()
+        if not source_url or not target_url:
+            continue
+        controls = build_backlink_controls(
+            table,
+            site_option_key=site_option,
+            data_date=data_date,
+            item=item,
+        )
+        lookup = (normalize_page_url(source_url), normalize_page_url(target_url))
+        row_id = row_index.get(lookup)
+        if row_id:
+            mingdao.edit_row(table.worksheet_id, row_id, controls)
+            updated += 1
+        else:
+            mingdao.add_row(table.worksheet_id, controls)
+            created += 1
+
+    report.log_api(
+        "sync",
+        f"backlinks ({site.key})",
+        detail=f"created={created} updated={updated} total={len(backlinks)}",
+    )
+    report.log_write(
+        BACKLINKS_LABEL,
+        "sync",
+        site.key,
+        {"新建": created, "更新": updated, "API返回": len(backlinks)},
+    )
+
+
 def sync_dashboard(
     config: Config,
     mingdao: MingdaoClient,
@@ -853,55 +1632,126 @@ def sync_dashboard(
     ahrefs: AhrefsClient,
     report: SyncReport,
     site: SiteConfig,
+    cache: SyncCache,
+    *,
+    page_stats: PageSyncStats | None = None,
+    force_refresh: bool = False,
 ) -> None:
-    data_date = get_target_date(config)
-    gsc_summary = gsc.query_site_summary(data_date)
+    anchor = get_sync_anchor_date(config)
+    page_stats = page_stats or PageSyncStats()
+    daily_data = fetch_gsc_daily_summaries(
+        gsc, site, config, cache, report, force_refresh=force_refresh
+    )
     ahrefs_summary = ahrefs.get_dashboard_summary()
 
-    this_week_start = data_date - dt.timedelta(days=6)
-    last_week_end = data_date - dt.timedelta(days=7)
-    last_week_start = data_date - dt.timedelta(days=13)
-    this_week_clicks = gsc.query_clicks_sum(this_week_start, data_date)
+    this_week_start = anchor - dt.timedelta(days=6)
+    last_week_end = anchor - dt.timedelta(days=7)
+    last_week_start = anchor - dt.timedelta(days=13)
+    this_week_clicks = gsc.query_clicks_sum(this_week_start, anchor)
     last_week_clicks = gsc.query_clicks_sum(last_week_start, last_week_end)
     traffic_week_change = calc_ratio_change(this_week_clicks, last_week_clicks)
 
-    fields: dict[str, Any] = {
-        "日期": data_date,
-        "独立站": site.key,
-        "自然点击": gsc_summary["clicks"],
-        "展示量": gsc_summary["impressions"],
-        "平均CTR": gsc_summary["ctr"],
-        "全站加权平均排名": round(gsc_summary["position"], 1) if gsc_summary["position"] else 0,
-        "Top10词数": ahrefs_summary["top10_count"],
-        "Top30词数": ahrefs_summary["top30_count"],
-        "近7天RD变化": ahrefs_summary["new_referring_domains"],
-        "已监控URL收录数": 0,
-        "已监控URL异常数": 0,
-        "异常预警": build_dashboard_alert(traffic_week_change),
-    }
-    if traffic_week_change is not None:
-        fields["周环比流量"] = round(traffic_week_change, 4)
-    if ahrefs_summary["top30_week_change"] is not None:
-        fields["周环比Top30词"] = round(ahrefs_summary["top30_week_change"], 4)
+    for data_date, gsc_summary in daily_data.items():
+        fields: dict[str, Any] = {
+            "日期": data_date,
+            "独立站": site.key,
+            "自然点击": int(gsc_summary.get("clicks") or 0),
+            "展示量": int(gsc_summary.get("impressions") or 0),
+            "平均CTR": float(gsc_summary.get("ctr") or 0),
+            "全站加权平均排名": round(float(gsc_summary.get("position") or 0), 1),
+        }
 
-    fields = {key: value for key, value in fields.items() if value is not None}
-    report.log_api(
-        "sync",
-        f"dashboard payload ({site.key})",
-        detail=format_fields_for_report(fields),
-    )
-    mingdao.upsert_dashboard(data_date, fields, site.key)
-    report.log_skip("页面管理表", "二期接入；收录数/异常数暂写 0")
-    report.log_skip("关键词/外链表", "二期接入 Mingdao")
+        if data_date == anchor:
+            fields.update(
+                {
+                    "Top10词数": ahrefs_summary["top10_count"],
+                    "Top30词数": ahrefs_summary["top30_count"],
+                    "近7天RD变化": ahrefs_summary["new_referring_domains"],
+                    "已监控URL收录数": page_stats.indexed_count,
+                    "已监控URL异常数": page_stats.issues_count,
+                    "异常预警": build_dashboard_alert(traffic_week_change),
+                }
+            )
+            if traffic_week_change is not None:
+                fields["周环比流量"] = round(traffic_week_change, 4)
+            if ahrefs_summary["top30_week_change"] is not None:
+                fields["周环比Top30词"] = round(ahrefs_summary["top30_week_change"], 4)
+
+        if is_provisional_gsc_zero(gsc_summary, data_date, config):
+            report.log_warning(
+                f"{site.key} {data_date.isoformat()} GSC 仍为 0，可能尚未出数；"
+                f"可稍后重跑 sync（缓存会在 {config.data_delay_days}+{config.gsc_recent_refresh_days} 天内自动重拉）"
+            )
+
+        report.log_api(
+            "sync",
+            f"dashboard payload ({site.key})",
+            detail=format_fields_for_report(fields),
+        )
+        mingdao.upsert_dashboard(data_date, fields, site.key)
 
 
-def run_sync(*, test_mingdao_only: bool = False, site_filter: list[str] | None = None) -> Path:
+def sync_site(
+    config: Config,
+    mingdao: MingdaoClient,
+    gsc: GSCClient,
+    ahrefs: AhrefsClient,
+    report: SyncReport,
+    site: SiteConfig,
+    cache: SyncCache,
+    *,
+    tables: SyncTables | None = None,
+    force_refresh: bool = False,
+) -> None:
+    tables = tables or SyncTables()
+    anchor = get_sync_anchor_date(config)
+    page_stats = PageSyncStats()
+
+    if tables.keywords:
+        sync_keywords(config, mingdao, ahrefs, report, site, anchor)
+    if tables.pages:
+        page_stats = sync_pages(config, mingdao, gsc, report, site, anchor)
+    if tables.backlinks:
+        sync_backlinks(config, mingdao, ahrefs, report, site, anchor)
+    if tables.dashboard:
+        sync_dashboard(
+            config,
+            mingdao,
+            gsc,
+            ahrefs,
+            report,
+            site,
+            cache,
+            page_stats=page_stats,
+            force_refresh=force_refresh,
+        )
+
+
+def run_sync(
+    *,
+    test_mingdao_only: bool = False,
+    site_filter: list[str] | None = None,
+    force_refresh: bool = False,
+    tables: SyncTables | None = None,
+) -> Path:
     setup_logging()
     logging.info("SEO Mingdao data sync started")
 
     config = Config.load(site_filter=site_filter)
-    report = SyncReport(started_at=dt.datetime.now(), data_date=get_target_date(config), config=config)
+    cache = SyncCache(enabled=config.cache_enabled)
+    anchor = get_sync_anchor_date(config)
+    dates = get_dashboard_dates(config)
+    report = SyncReport(started_at=dt.datetime.now(), data_date=anchor, config=config)
     mingdao = MingdaoClient(config, report)
+
+    logging.info(
+        "Sync window: %s .. %s (%s days), anchor=%s, cache=%s",
+        dates[0].isoformat(),
+        dates[-1].isoformat(),
+        len(dates),
+        anchor.isoformat(),
+        "on" if config.cache_enabled else "off",
+    )
 
     mingdao.test_connection()
 
@@ -913,8 +1763,24 @@ def run_sync(*, test_mingdao_only: bool = False, site_filter: list[str] | None =
         logging.info("Syncing site: %s (GSC=%s, Ahrefs=%s)", site.key, site.gsc_site_url, site.ahrefs_domain)
         try:
             gsc = GSCClient(config, report, site_url=site.gsc_site_url)
-            ahrefs = AhrefsClient(config, report, target_domain=site.ahrefs_domain, site_key=site.key)
-            sync_dashboard(config, mingdao, gsc, ahrefs, report, site)
+            ahrefs = AhrefsClient(
+                config,
+                report,
+                target_domain=site.ahrefs_domain,
+                site_key=site.key,
+                report_date=anchor,
+            )
+            sync_site(
+                config,
+                mingdao,
+                gsc,
+                ahrefs,
+                report,
+                site,
+                cache,
+                tables=tables,
+                force_refresh=force_refresh,
+            )
         except Exception as exc:
             report.log_warning(f"{site.key} sync failed: {exc}")
             logging.exception("Site sync failed: %s", site.key)
@@ -938,12 +1804,48 @@ def parse_args() -> argparse.Namespace:
         metavar="SITE",
         help="Sync only this site key (repeatable). Default: all sites in config/sites.json",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Ignore local GSC cache and re-fetch all dashboard dates",
+    )
+    parser.add_argument(
+        "--skip-keywords",
+        action="store_true",
+        help="Skip 站点关键词库",
+    )
+    parser.add_argument(
+        "--skip-pages",
+        action="store_true",
+        help="Skip 页面管理表",
+    )
+    parser.add_argument(
+        "--skip-backlinks",
+        action="store_true",
+        help="Skip 外链监控表",
+    )
+    parser.add_argument(
+        "--skip-dashboard",
+        action="store_true",
+        help="Skip SEO 自动数据看板",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_sync(test_mingdao_only=args.test_mingdao_only, site_filter=args.sites)
+    tables = SyncTables(
+        keywords=not args.skip_keywords,
+        pages=not args.skip_pages,
+        backlinks=not args.skip_backlinks,
+        dashboard=not args.skip_dashboard,
+    )
+    run_sync(
+        test_mingdao_only=args.test_mingdao_only,
+        site_filter=args.sites,
+        force_refresh=args.refresh,
+        tables=tables,
+    )
 
 
 if __name__ == "__main__":

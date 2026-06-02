@@ -5,6 +5,7 @@ token.json
 .venv/
 logs/
 reports/
+cache/
 __pycache__/
 *.pyc
 docs/seo-data-dashboard-note1.md

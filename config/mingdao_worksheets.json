@@ -23,6 +23,7 @@
     "worksheet_id": "6a1d1e60113e1b2e9c6f5e56",
     "fields": {
       "site": "6a1d2924aa351318ffd04de3",
+      "page_url": "6a1d1e60113e1b2e9c6f5e57",
       "index_status": "6a1d2924aa351318ffd04de6",
       "traffic": "6a1d2924aa351318ffd04de7",
       "data_date": "6a1d2924aa351318ffd04de8"
@@ -33,12 +34,21 @@
       "richconn": "d6451120-f481-446b-b6be-72af2227d502",
       "lasermicrofab": "16b531e6-2e2d-461c-adda-5547c2f63bbd",
       "drametal": "3c4dd4eb-1d69-482d-8c30-d478b432ec4d"
+    },
+    "index_status_option_keys": {
+      "已收录": "40b746b1-de09-483c-97b7-af59c36b121a",
+      "未收录": "b8b4c6ea-746a-4171-87c2-84fd29b4d617",
+      "索引异常": "d6451120-f481-446b-b6be-72af2227d502"
     }
   },
   "backlinks": {
     "worksheet_id": "6a1d1eae552f90d5dd3a4f8e",
     "fields": {
       "site": "6a1d2be3e30907a70fa44004",
+      "source_domain": "6a1d1eae552f90d5dd3a4f8f",
+      "source_url": "6a1d1eae552f90d5dd3a4f90",
+      "target_url": "6a1d1eae552f90d5dd3a4f91",
+      "anchor": "6a1d1eae552f90d5dd3a4f92",
       "domain_dr": "6a1d2be3e30907a70fa44005",
       "is_dofollow": "6a1d2be3e30907a70fa44006",
       "first_seen": "6a1d2be3e30907a70fa44007",

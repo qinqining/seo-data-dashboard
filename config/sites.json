@@ -12,17 +12,17 @@
     },
     {
       "key": "richconn",
-      "gsc_site_url": "https://www.richconn.com/",
+      "gsc_site_url": "sc-domain:richconn.com",
       "ahrefs_domain": "richconn.com"
     },
     {
       "key": "lasermicrofab",
-      "gsc_site_url": "https://www.lasermicrofab.com/",
+      "gsc_site_url": "sc-domain:lasermicrofab.com",
       "ahrefs_domain": "lasermicrofab.com"
     },
     {
       "key": "drametal",
-      "gsc_site_url": "https://www.drametal.com/",
+      "gsc_site_url": "sc-domain:drametal.com",
       "ahrefs_domain": "drametal.com"
     }
   ]
