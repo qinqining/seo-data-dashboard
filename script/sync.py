@@ -120,11 +120,13 @@ class SyncReport:
     started_at: dt.datetime
     data_date: dt.date
     config: "Config"
+    tables: SyncTables | None = None
     api_calls: list[str] | None = None
     writes: list[str] | None = None
     skips: list[str] | None = None
     warnings: list[str] | None = None
     keyword_grading_lines: list[str] | None = None
+    site_outcomes: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.api_calls = []
@@ -132,6 +134,7 @@ class SyncReport:
         self.skips = []
         self.warnings = []
         self.keyword_grading_lines = []
+        self.site_outcomes = []
 
     def log_api(
         self,
@@ -163,25 +166,126 @@ class SyncReport:
         self.warnings.append(message)
         logging.warning(message)
 
+    def record_site_outcome(self, site_key: str, *, ok: bool, error: str = "") -> None:
+        self.site_outcomes.append({"site": site_key, "ok": ok, "error": error})
+
     def add_keyword_grading_report(self, lines: list[str]) -> None:
         self.keyword_grading_lines.extend(lines)
+
+    def _write_count_for_table(self, table_label: str) -> tuple[int, int]:
+        creates = updates = 0
+        needle = f"[WRITE] {table_label} "
+        for line in self.writes:
+            if not line.startswith(needle):
+                continue
+            if " create " in line:
+                creates += 1
+            elif " update " in line:
+                updates += 1
+        return creates, updates
+
+    def _dashboard_rows_for_site(self, site_key: str) -> int:
+        prefix = f"key={site_key}@"
+        return sum(
+            1 for line in self.writes if line.startswith(f"[WRITE] {DASHBOARD_LABEL}") and prefix in line
+        )
+
+    def render_summary(self, finished_at: dt.datetime) -> list[str]:
+        elapsed = max(0, (finished_at - self.started_at).total_seconds())
+        tables = self.tables or SyncTables()
+        failed = [o for o in self.site_outcomes if not o["ok"]]
+        succeeded = [o for o in self.site_outcomes if o["ok"]]
+        api_fail = sum(1 for line in self.api_calls if "[API][FAIL]" in line)
+
+        if not self.site_outcomes:
+            overall = "测试/未跑站点"
+        elif failed and not succeeded:
+            overall = "失败"
+        elif failed:
+            overall = "部分成功"
+        elif self.warnings or api_fail:
+            overall = "全部完成（有警告）"
+        else:
+            overall = "全部成功"
+
+        modules: list[str] = []
+        if tables.dashboard:
+            modules.append("看板")
+        if tables.keywords:
+            modules.append("关键词")
+        if tables.pages:
+            modules.append("页面")
+        if tables.backlinks:
+            modules.append("外链")
+        module_text = "、".join(modules) if modules else "(无)"
+
+        dash_create, dash_update = self._write_count_for_table(DASHBOARD_LABEL)
+        expected_dash = (
+            len(self.config.sites) * self.config.dashboard_sync_days if tables.dashboard else 0
+        )
+
+        lines = [
+            "",
+            "Summary 总结",
+            "-" * 60,
+            f"Overall       : {overall}",
+            f"Duration      : {elapsed:.0f}s",
+            f"Sync modules  : {module_text}",
+            f"Anchor date   : {self.data_date.isoformat()}",
+            f"Dashboard win : {self.config.dashboard_sync_days} days ending on anchor",
+            f"Mingdao writes: {len(self.writes)} total (create {dash_create}, update {dash_update} on 看板)",
+            f"Warnings      : {len(self.warnings)}",
+            f"API failures  : {api_fail}",
+        ]
+        if tables.dashboard and expected_dash:
+            lines.append(f"Dashboard rows: {dash_create + dash_update} written / {expected_dash} expected")
+
+        if self.site_outcomes:
+            lines.append("Per site:")
+            for outcome in self.site_outcomes:
+                site_key = outcome["site"]
+                if outcome["ok"]:
+                    detail = f"OK"
+                    if tables.dashboard:
+                        rows = self._dashboard_rows_for_site(site_key)
+                        detail += f", 看板 {rows}/{self.config.dashboard_sync_days} 行"
+                    lines.append(f"  - {site_key}: {detail}")
+                else:
+                    err = outcome.get("error") or "unknown error"
+                    short = err.replace("\n", " ")[:120]
+                    lines.append(f"  - {site_key}: FAIL — {short}")
+
+        return lines
 
     def save(self) -> Path:
         finished_at = dt.datetime.now()
         report_path = REPORT_DIR / f"sync-report-{self.started_at.strftime('%Y%m%d-%H%M%S')}.txt"
+        summary_lines = self.render_summary(finished_at)
         lines = [
             "SEO Mingdao Sync Report",
             "=" * 60,
             f"Started : {self.started_at.isoformat(sep=' ', timespec='seconds')}",
             f"Finished: {finished_at.isoformat(sep=' ', timespec='seconds')}",
-            f"Anchor date : {self.data_date.isoformat()} (today - DATA_DELAY_DAYS={self.config.data_delay_days})",
+            f"Anchor date : {self.data_date.isoformat()}",
             f"Dashboard   : {self.config.dashboard_sync_days} days ending on anchor",
             f"Sites     : {', '.join(site.key for site in self.config.sites)}",
-            "",
-            f"API calls ({len(self.api_calls)})",
-            "-" * 60,
         ]
+        lines.extend(summary_lines)
+        lines.extend(
+            [
+                "",
+                f"API calls ({len(self.api_calls)})",
+                "-" * 60,
+            ]
+        )
         lines.extend(self.api_calls or ["(none)"])
+        overall_line = next((ln for ln in summary_lines if ln.startswith("Overall")), "Overall: ?")
+        logging.info(
+            "Sync summary: %s | writes=%s warnings=%s",
+            overall_line.split(":", 1)[-1].strip(),
+            len(self.writes),
+            len(self.warnings),
+        )
         lines.extend(["", f"Mingdao writes ({len(self.writes)})", "-" * 60])
         lines.extend(self.writes or ["(none)"])
         lines.extend(["", f"Skipped ({len(self.skips)})", "-" * 60])
@@ -237,7 +341,9 @@ class DashboardFieldIds:
     top4_10: str
     top11_20: str
     top21_100: str
-    rd_delta: str
+    backlinks: str
+    weekly_avg_position: str | None
+    weekly_avg_clicks: str | None
     indexed: str
     issues: str
     alert: str
@@ -360,7 +466,16 @@ class Config:
                 top4_10=env_required("MINGDAO_FIELD_DASH_TOP4_10"),
                 top11_20=env_required("MINGDAO_FIELD_DASH_TOP11_20"),
                 top21_100=env_required("MINGDAO_FIELD_DASH_TOP21_100"),
-                rd_delta=env_required("MINGDAO_FIELD_DASH_RD_DELTA"),
+                backlinks=_env_dashboard_field(
+                    "MINGDAO_FIELD_DASH_BACKLINKS",
+                    "MINGDAO_FIELD_DASH_RD_DELTA",
+                ),
+                weekly_avg_position=os.getenv("MINGDAO_FIELD_DASH_WEEKLY_AVG_POSITION", "").strip() or None,
+                weekly_avg_clicks=(
+                    os.getenv("MINGDAO_FIELD_DASH_WEEKLY_CLICKS", "").strip()
+                    or os.getenv("周自然点击", "").strip()
+                    or None
+                ),
                 indexed=env_required("MINGDAO_FIELD_DASH_INDEXED"),
                 issues=env_required("MINGDAO_FIELD_DASH_ISSUES"),
                 alert=env_required("MINGDAO_FIELD_DASH_ALERT"),
@@ -609,6 +724,15 @@ def env_required(name: str) -> str:
     return value
 
 
+def _env_dashboard_field(primary: str, *legacy_names: str) -> str:
+    for name in (primary, *legacy_names):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    known = ", ".join((primary, *legacy_names))
+    raise RuntimeError(f"Missing required env var (one of): {known}")
+
+
 def normalize_ahrefs_domain(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -633,6 +757,22 @@ def resolve_sync_anchor_date(config: Config, override: str | None) -> dt.date:
 
 def get_target_date(config: Config, *, anchor_override: str | None = None) -> dt.date:
     return resolve_sync_anchor_date(config, anchor_override)
+
+
+def calc_weekly_avg_position(daily_data: dict[dt.date, dict[str, Any]]) -> float | None:
+    """同步窗口内（通常 7 天）全站加权平均排名的算术平均，供看板「周平均排名」。"""
+    if not daily_data:
+        return None
+    positions = [float(day.get("position") or 0) for day in daily_data.values()]
+    return round(sum(positions) / len(positions), 1)
+
+
+def calc_weekly_avg_clicks(daily_data: dict[dt.date, dict[str, Any]]) -> float | None:
+    """同步窗口内（通常 7 天）自然点击的算术平均，供看板「周自然点击」。"""
+    if not daily_data:
+        return None
+    clicks = [int(day.get("clicks") or 0) for day in daily_data.values()]
+    return round(sum(clicks) / len(clicks), 1)
 
 
 def get_dashboard_dates(config: Config, *, anchor: dt.date | None = None) -> list[dt.date]:
@@ -732,9 +872,10 @@ def fetch_gsc_daily_summaries(
     cache: SyncCache,
     report: SyncReport,
     *,
+    anchor: dt.date | None = None,
     force_refresh: bool = False,
 ) -> dict[dt.date, dict[str, Any]]:
-    dates = get_dashboard_dates(config)
+    dates = get_dashboard_dates(config, anchor=anchor)
     start, end = dates[0], dates[-1]
     needs_fetch = any(
         cache.needs_gsc_fetch(site.key, day, config, force=force_refresh) for day in dates
@@ -950,7 +1091,7 @@ def build_dashboard_controls(config: Config, logical_fields: dict[str, Any], sit
         "Top4-10词数": fields.top4_10,
         "Top11-20词数": fields.top11_20,
         "Top21-100词数": fields.top21_100,
-        "近7天RD变化": fields.rd_delta,
+        "Backlinks变化": fields.backlinks,
         "已监控URL收录数": fields.indexed,
         "已监控URL异常数": fields.issues,
         "异常预警": fields.alert,
@@ -960,6 +1101,10 @@ def build_dashboard_controls(config: Config, logical_fields: dict[str, Any], sit
         "周环比Top11-20词": fields.top11_20_wow,
         "周环比Top21-100词": fields.top21_100_wow,
     }
+    if fields.weekly_avg_position:
+        mapping["周平均排名"] = fields.weekly_avg_position
+    if fields.weekly_avg_clicks:
+        mapping["周自然点击"] = fields.weekly_avg_clicks
 
     controls: list[dict[str, str]] = []
     for name, control_id in mapping.items():
@@ -1349,42 +1494,72 @@ class AhrefsClient:
         )
         self.report_date = report_date or get_sync_anchor_date(config)
         self.compare_date = self.report_date - dt.timedelta(days=7)
-        self._organic_rankings: dict[str, dict[str, Any]] | None = None
+        self._rankings_by_date: dict[str, dict[str, dict[str, Any]]] = {}
 
     def load_organic_rankings(self) -> dict[str, dict[str, Any]]:
-        if self._organic_rankings is not None:
-            return self._organic_rankings
+        """锚点日有机词（关键词同步等沿用）。"""
+        return self.load_organic_rankings_for_date(self.report_date)
 
+    def load_organic_rankings_for_date(self, report_date: dt.date) -> dict[str, dict[str, Any]]:
+        cache_key = report_date.isoformat()
+        cached = self._rankings_by_date.get(cache_key)
+        if cached is not None:
+            return cached
+
+        compare_date = report_date - dt.timedelta(days=7)
         if self._is_aggregate_all():
-            rankings, countries = self._load_organic_rankings_all_countries()
+            rankings, countries = self._load_organic_rankings_all_countries(
+                report_date, compare_date
+            )
             detail = (
-                f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} "
-                f"countries={len(countries)} count={len(rankings)} mode=aggregate"
+                f"site={self.site_key} target={self.target_domain} date={report_date.isoformat()} "
+                f"compared={compare_date.isoformat()} countries={len(countries)} "
+                f"count={len(rankings)} mode=aggregate"
             )
         else:
-            rankings = self._load_organic_rankings_for_country(self.config.ahrefs_target_country)
+            rankings = self._load_organic_rankings_for_country(
+                self.config.ahrefs_target_country,
+                report_date=report_date,
+                compare_date=compare_date,
+            )
             detail = (
-                f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} "
-                f"country={self.config.ahrefs_target_country} count={len(rankings)}"
+                f"site={self.site_key} target={self.target_domain} date={report_date.isoformat()} "
+                f"compared={compare_date.isoformat()} country={self.config.ahrefs_target_country} "
+                f"count={len(rankings)}"
             )
 
-        self._organic_rankings = rankings
-        logging.info("Loaded %s organic keywords from Ahrefs", len(rankings))
+        self._rankings_by_date[cache_key] = rankings
+        logging.info(
+            "Loaded %s organic keywords from Ahrefs for %s",
+            len(rankings),
+            report_date.isoformat(),
+        )
         if self.report:
             self.report.log_api("Ahrefs", "site-explorer/organic-keywords", detail=detail)
         return rankings
 
+    def get_rank_bucket_summary_for_date(self, report_date: dt.date) -> dict[str, Any]:
+        """指定日的四档词数 + 对比日（report_date-7）的周环比。"""
+        rankings = self.load_organic_rankings_for_date(report_date)
+        return build_rank_bucket_summary(rankings)
+
     def _is_aggregate_all(self) -> bool:
         return self.config.ahrefs_target_country == "all"
 
-    def _load_organic_rankings_for_country(self, country: str) -> dict[str, dict[str, Any]]:
+    def _load_organic_rankings_for_country(
+        self,
+        country: str,
+        *,
+        report_date: dt.date,
+        compare_date: dt.date,
+    ) -> dict[str, dict[str, Any]]:
         payload = self._request(
             "site-explorer/organic-keywords",
             {
                 "target": self.target_domain,
                 "country": country.lower(),
-                "date": self.report_date.isoformat(),
-                "date_compared": self.compare_date.isoformat(),
+                "date": report_date.isoformat(),
+                "date_compared": compare_date.isoformat(),
                 "select": (
                     "keyword,volume,keyword_difficulty,cpc,"
                     "is_transactional,is_commercial,is_navigational,is_branded,is_local,is_informational,"
@@ -1400,7 +1575,7 @@ class AhrefsClient:
                 rankings[str(keyword).casefold()] = item
         return rankings
 
-    def _resolve_aggregate_countries(self) -> list[str]:
+    def _resolve_aggregate_countries(self, report_date: dt.date) -> list[str]:
         if self.config.ahrefs_aggregate_countries:
             return list(self.config.ahrefs_aggregate_countries)
 
@@ -1408,7 +1583,7 @@ class AhrefsClient:
             "site-explorer/metrics-by-country",
             {
                 "target": self.target_domain,
-                "date": self.report_date.isoformat(),
+                "date": report_date.isoformat(),
                 "select": "country,org_keywords,org_traffic",
             },
         )
@@ -1431,11 +1606,19 @@ class AhrefsClient:
         )
         return countries
 
-    def _load_organic_rankings_all_countries(self) -> tuple[dict[str, dict[str, Any]], list[str]]:
-        countries = self._resolve_aggregate_countries()
+    def _load_organic_rankings_all_countries(
+        self,
+        report_date: dt.date,
+        compare_date: dt.date,
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        countries = self._resolve_aggregate_countries(report_date)
         merged: dict[str, dict[str, Any]] = {}
         for country in countries:
-            country_rankings = self._load_organic_rankings_for_country(country)
+            country_rankings = self._load_organic_rankings_for_country(
+                country,
+                report_date=report_date,
+                compare_date=compare_date,
+            )
             for key, item in country_rankings.items():
                 existing = merged.get(key)
                 if existing is None:
@@ -1445,24 +1628,14 @@ class AhrefsClient:
         return merged, countries
 
     def get_dashboard_summary(self) -> dict[str, Any]:
-        rankings = self.load_organic_rankings()
-        bucket_summary = build_rank_bucket_summary(rankings)
+        """锚点日汇总：Backlinks 净值等（四档词数改由看板按日拉取）。"""
         new_rd = self._get_refdomains_delta()
-        summary = {**bucket_summary, "new_referring_domains": new_rd}
+        summary: dict[str, Any] = {"new_referring_domains": new_rd}
         if self.report:
             self.report.log_api(
                 "Ahrefs",
                 "dashboard summary",
-                detail=(
-                    f"site={self.site_key} "
-                    f"top1_3={bucket_summary['top1_3']} top4_10={bucket_summary['top4_10']} "
-                    f"top11_20={bucket_summary['top11_20']} top21_100={bucket_summary['top21_100']} "
-                    f"new_rd={new_rd} "
-                    f"wow1_3={bucket_summary.get('top1_3_wow')} "
-                    f"wow4_10={bucket_summary.get('top4_10_wow')} "
-                    f"wow11_20={bucket_summary.get('top11_20_wow')} "
-                    f"wow21_100={bucket_summary.get('top21_100_wow')}"
-                ),
+                detail=f"site={self.site_key} date={self.report_date.isoformat()} backlinks={new_rd}",
             )
         return summary
 
@@ -1568,7 +1741,7 @@ def build_rank_bucket_summary(rankings: dict[str, dict[str, Any]]) -> dict[str, 
 
 
 def rank_bucket_logical_fields(ahrefs_summary: dict[str, Any]) -> dict[str, Any]:
-    """锚点日看板：四档词数 + 四档周环比（对比日为锚点-7）。"""
+    """看板：四档词数 + 四档周环比（对比日为该行日期-7）。"""
     fields: dict[str, Any] = {}
     for label, key, _lo, _hi in RANK_BUCKET_SPECS:
         fields[label] = ahrefs_summary[key]
@@ -2031,15 +2204,15 @@ def sync_dashboard(
     site: SiteConfig,
     cache: SyncCache,
     *,
+    anchor: dt.date,
     page_stats: PageSyncStats | None = None,
     force_refresh: bool = False,
 ) -> None:
-    anchor = get_sync_anchor_date(config)
     page_stats = page_stats or PageSyncStats()
     daily_data = fetch_gsc_daily_summaries(
-        gsc, site, config, cache, report, force_refresh=force_refresh
+        gsc, site, config, cache, report, anchor=anchor, force_refresh=force_refresh
     )
-    ahrefs_summary = ahrefs.get_dashboard_summary()
+    ahrefs_anchor_summary = ahrefs.get_dashboard_summary()
 
     this_week_start = anchor - dt.timedelta(days=6)
     last_week_end = anchor - dt.timedelta(days=7)
@@ -2047,8 +2220,11 @@ def sync_dashboard(
     this_week_clicks = gsc.query_clicks_sum(this_week_start, anchor)
     last_week_clicks = gsc.query_clicks_sum(last_week_start, last_week_end)
     traffic_week_change = calc_ratio_change(this_week_clicks, last_week_clicks)
+    weekly_avg_rank = calc_weekly_avg_position(daily_data)
+    weekly_avg_clicks = calc_weekly_avg_clicks(daily_data)
 
     for data_date, gsc_summary in daily_data.items():
+        rank_buckets = ahrefs.get_rank_bucket_summary_for_date(data_date)
         fields: dict[str, Any] = {
             "日期": data_date,
             "独立站": site.key,
@@ -2056,18 +2232,22 @@ def sync_dashboard(
             "展示量": int(gsc_summary.get("impressions") or 0),
             "平均CTR": float(gsc_summary.get("ctr") or 0),
             "全站加权平均排名": round(float(gsc_summary.get("position") or 0), 1),
+            **rank_bucket_logical_fields(rank_buckets),
         }
 
         if data_date == anchor:
             fields.update(
                 {
-                    **rank_bucket_logical_fields(ahrefs_summary),
-                    "近7天RD变化": ahrefs_summary["new_referring_domains"],
+                    "Backlinks变化": ahrefs_anchor_summary["new_referring_domains"],
                     "已监控URL收录数": page_stats.indexed_count,
                     "已监控URL异常数": page_stats.issues_count,
                     "异常预警": build_dashboard_alert(traffic_week_change),
                 }
             )
+            if weekly_avg_rank is not None and config.dashboard_fields.weekly_avg_position:
+                fields["周平均排名"] = weekly_avg_rank
+            if weekly_avg_clicks is not None and config.dashboard_fields.weekly_avg_clicks:
+                fields["周自然点击"] = weekly_avg_clicks
             if traffic_week_change is not None:
                 fields["周环比流量"] = round(traffic_week_change, 4)
 
@@ -2120,6 +2300,7 @@ def sync_site(
             report,
             site,
             cache,
+            anchor=anchor,
             page_stats=page_stats,
             force_refresh=force_refresh,
         )
@@ -2140,7 +2321,13 @@ def run_sync(
     cache = SyncCache(enabled=config.cache_enabled)
     anchor = resolve_sync_anchor_date(config, anchor_date)
     dates = get_dashboard_dates(config, anchor=anchor)
-    report = SyncReport(started_at=dt.datetime.now(), data_date=anchor, config=config)
+    tables = tables or SyncTables()
+    report = SyncReport(
+        started_at=dt.datetime.now(),
+        data_date=anchor,
+        config=config,
+        tables=tables,
+    )
     mingdao = MingdaoClient(config, report)
 
     logging.info(
@@ -2158,7 +2345,6 @@ def run_sync(
         report.log_skip("sync", "test-mingdao-only: skipped GSC/Ahrefs write")
         return report.save()
 
-    tables = tables or SyncTables()
     google_credentials: Any | None = None
     if sync_needs_gsc(tables):
         try:
@@ -2240,6 +2426,11 @@ def run_sync(
                 break
         if not site_ok and last_error is not None:
             logging.error("%s skipped after %s attempt(s)", site.key, SITE_SYNC_MAX_ATTEMPTS)
+        report.record_site_outcome(
+            site.key,
+            ok=site_ok,
+            error="" if site_ok else str(last_error or "sync failed"),
+        )
 
     report_path = report.save()
     logging.info("SEO Mingdao data sync finished. Report: %s", report_path)
