@@ -1,4 +1,5 @@
 {
+  "_comment_sites": "仅 SEO自动数据看板 的「独立站」单选 key；关键词/页面/外链各表 UUID 在 mingdao_worksheets.json",
   "sites": {
     "cncpioneer": "06445848-cf1b-4d3d-a63d-5da8ac85c093",
     "fecision": "386f967d-e856-4b2e-8c23-150cdf954576",
@@ -13,11 +14,9 @@
   },
   "keyword_intent_option_keys": {
     "信息类": "f403175c-fbaa-4899-b4da-fcacebf9c504",
-    "商业/比价类": "c7abe568-8de4-4662-a033-17b1173dc013",
+    "商业类": "c7abe568-8de4-4662-a033-17b1173dc013",
     "交易类": "72e804a7-92a1-422d-a8d5-e4915578255b",
-    "导航/找品牌": "fee6b613-d2e8-4c3b-9a4e-8747ea87761b",
-    "品牌词": "aea6c2d6-a990-41e7-80c9-914fc36b94ab",
-    "本地类": "82a2f808-e216-437a-bfa6-a2dd88c4b0c4"
+    "导航类": "fee6b613-d2e8-4c3b-9a4e-8747ea87761b"
   },
   "keyword_priority_option_keys": {
     "P0": "6d259ea7-aa61-4051-bb06-0f981647ab9b",

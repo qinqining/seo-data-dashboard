@@ -3,22 +3,26 @@
     {
       "key": "cncpioneer",
       "gsc_site_url": "https://www.cncpioneer.com/",
-      "ahrefs_domain": "cncpioneer.com"
+      "ahrefs_domain": "cncpioneer.com",
+      "homepage_url": "https://www.cncpioneer.com/"
     },
     {
       "key": "fecision",
       "gsc_site_url": "https://fecision.com/",
-      "ahrefs_domain": "fecision.com"
+      "ahrefs_domain": "fecision.com",
+      "homepage_url": "https://fecision.com/"
     },
     {
       "key": "richconn",
       "gsc_site_url": "sc-domain:richconn.com",
-      "ahrefs_domain": "richconn.com"
+      "ahrefs_domain": "richconn.com",
+      "homepage_url": "https://richconn.com/"
     },
     {
       "key": "lasermicrofab",
       "gsc_site_url": "sc-domain:lasermicrofab.com",
-      "ahrefs_domain": "lasermicrofab.com"
+      "ahrefs_domain": "lasermicrofab.com",
+      "homepage_url": "https://www.lasermicrofab.com/"
     },
     {
       "key": "drametal",

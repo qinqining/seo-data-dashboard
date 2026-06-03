@@ -1,40 +1,40 @@
 """
-站点关键词分级：仅 Ahrefs 六类搜索意图 + 价值分公式（见 docs/keyword-grading-scheme.md）。
+站点关键词分级：Ahrefs Intent → 四类搜索意图 + 价值分（见 docs/keyword-grading-scheme.md）。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+# 与 config/mingdao_options.json → keyword_intent_option_keys 一致
 PRIMARY_INTENT_SPECS: tuple[tuple[str, str], ...] = (
     ("交易类", "is_transactional"),
-    ("商业/比价类", "is_commercial"),
-    ("导航/找品牌", "is_navigational"),
-    ("品牌词", "is_branded"),
-    ("本地类", "is_local"),
+    ("商业类", "is_commercial"),
+    ("导航类", "is_navigational"),
     ("信息类", "is_informational"),
 )
 
 INTENT_COEFFICIENTS: dict[str, float] = {
     "交易类": 1.5,
-    "商业/比价类": 1.5,
-    "导航/找品牌": 1.0,
-    "品牌词": 1.0,
-    "本地类": 1.1,
+    "商业类": 1.5,
+    "导航类": 1.0,
     "信息类": 1.0,
 }
 
 INTENT_PRIORITY_CEILING: dict[str, str | None] = {
     "交易类": None,
-    "商业/比价类": None,
-    "导航/找品牌": "P2",
-    "品牌词": "P2",
-    "本地类": "P2",
+    "商业类": None,
+    "导航类": "P2",
     "信息类": "P2",
 }
 
 PRIORITY_RANK: tuple[str, ...] = ("P0", "P1", "P2", "P3", "未分级")
 DEFAULT_CPC = 0.5
+# 价值分加权（满分 100，见 docs/keyword-grading-scheme.md §2）
+VOL_SCORE_MAX = 40.0
+CPC_SCORE_MAX = 35.0
+VOL_SCORE_PER_1K = 40.0
+CPC_SCORE_PER_USD = 10.0
 
 
 def normalize_ahrefs_cpc(cpc: float | int | None) -> float | None:
@@ -48,6 +48,10 @@ def resolve_primary_intent(item: dict[str, Any]) -> str | None:
     for label, field in PRIMARY_INTENT_SPECS:
         if item.get(field):
             return label
+    if item.get("is_branded"):
+        return "导航类"
+    if item.get("is_local"):
+        return "商业类"
     return None
 
 
@@ -64,15 +68,18 @@ def score_keyword(
     cpc: float | int | None,
     intent: str | None,
 ) -> float | None:
+    """加权价值分，结果 capped 在 0～100。"""
     if volume is None or kd is None:
         return None
     vol = float(volume)
     difficulty = float(kd)
-    normalized = normalize_ahrefs_cpc(cpc)
-    cost = DEFAULT_CPC if normalized is None else normalized
-    coeff = intent_coefficient(intent)
-    raw = ((vol / 1000 * 60) + (cost * 80)) * coeff / (difficulty + 20) * 100
-    return round(raw, 2)
+    cpc_usd = normalize_ahrefs_cpc(cpc)
+    cost = DEFAULT_CPC if cpc_usd is None else cpc_usd
+    vol_part = min(VOL_SCORE_MAX, (vol / 1000.0) * VOL_SCORE_PER_1K)
+    cpc_part = min(CPC_SCORE_MAX, cost * CPC_SCORE_PER_USD)
+    kd_discount = 20.0 / (difficulty + 20.0)
+    weighted = (vol_part + cpc_part) * intent_coefficient(intent) * kd_discount
+    return round(min(100.0, weighted), 2)
 
 
 def base_priority_from_score(score: float | None) -> str:
@@ -353,25 +360,6 @@ def format_grading_summary_lines(
             )
 
     return lines
-
-
-def grading_detail_csv_row(d: KeywordGradeDetail) -> dict[str, Any]:
-    return {
-        "keyword": d.keyword,
-        "volume": d.volume,
-        "kd": d.kd,
-        "cpc_cents": d.cpc_cents,
-        "cpc_usd": d.cpc_usd,
-        "rank": d.rank,
-        "intent": d.intent,
-        "intent_coef": d.intent_coef,
-        "value_score": d.value_score,
-        "base_priority": d.base_priority,
-        "after_intent_cap": d.after_intent_cap,
-        "final_priority": d.final_priority,
-        "adjustments": ";".join(d.adjustments),
-        "write_priority": d.write_priority,
-    }
 
 
 def priority_label_from_row_value(
