@@ -406,6 +406,7 @@ class SiteConfig:
     gsc_site_url: str
     ahrefs_domain: str
     homepage_url: str
+    gsc_top_countries: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -778,6 +779,18 @@ def parse_country_list(value: str) -> list[str]:
     return [part.strip().lower() for part in value.split(",") if part.strip()]
 
 
+def gsc_top_country_scope_label(site: SiteConfig) -> str:
+    if not site.gsc_top_countries:
+        return "all"
+    return ",".join(site.gsc_top_countries)
+
+
+def gsc_top_country_allowed(site: SiteConfig, country_code: str) -> bool:
+    if not site.gsc_top_countries:
+        return True
+    return country_code.lower() in site.gsc_top_countries
+
+
 def load_sites(site_filter: list[str] | None = None) -> list[SiteConfig]:
     if not SITES_FILE.exists():
         raise RuntimeError(f"Missing {SITES_FILE}")
@@ -791,12 +804,22 @@ def load_sites(site_filter: list[str] | None = None) -> list[SiteConfig]:
         homepage = str(item.get("homepage_url", "")).strip()
         if not homepage:
             homepage = gsc_url if gsc_url.startswith("https://") else f"https://{normalize_ahrefs_domain(str(item['ahrefs_domain']))}/"
+        raw_countries = item.get("gsc_top_countries")
+        if raw_countries:
+            gsc_top_countries = tuple(
+                part.strip().lower()
+                for part in raw_countries
+                if str(part).strip()
+            ) or None
+        else:
+            gsc_top_countries = None
         sites.append(
             SiteConfig(
                 key=key,
                 gsc_site_url=gsc_url,
                 ahrefs_domain=normalize_ahrefs_domain(str(item["ahrefs_domain"])),
                 homepage_url=homepage,
+                gsc_top_countries=gsc_top_countries,
             )
         )
     if not sites:
@@ -1495,20 +1518,35 @@ class GSCClient:
         *,
         row_limit: int = 1000,
         label: str = "searchAnalytics/query",
+        country_filter: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """按 dimensions 拉 Top 行（默认按点击降序），支持分页至 row_limit。"""
         rows_out: list[dict[str, Any]] = []
         start_row = 0
         batch_size = min(25000, max(1, row_limit))
+        allowed_countries: set[str] | None = None
+        if country_filter:
+            allowed_countries = {code.lower() for code in country_filter}
 
         while len(rows_out) < row_limit:
-            body = {
+            body: dict[str, Any] = {
                 "startDate": date_value.isoformat(),
                 "endDate": date_value.isoformat(),
                 "dimensions": dimensions,
                 "rowLimit": min(batch_size, row_limit - len(rows_out)),
                 "startRow": start_row,
             }
+            if country_filter and len(country_filter) == 1:
+                body["dimensionFilterGroups"] = [
+                    {
+                        "filters": [
+                            {
+                                "dimension": "country",
+                                "expression": country_filter[0].lower(),
+                            }
+                        ]
+                    }
+                ]
             result = self._query_search_analytics(body)
             batch = result.get("rows", [])
             if not batch:
@@ -1517,6 +1555,11 @@ class GSCClient:
                 keys = row.get("keys", [])
                 if len(keys) != len(dimensions):
                     continue
+                if allowed_countries and "country" in dimensions:
+                    country_idx = dimensions.index("country")
+                    country_code = str(keys[country_idx]).strip().lower()
+                    if country_code not in allowed_countries:
+                        continue
                 item = {
                     "keys": keys,
                     "clicks": int(row.get("clicks", 0)),
@@ -1532,12 +1575,13 @@ class GSCClient:
             start_row += len(batch)
 
         if self.report:
+            country_note = f" countries={','.join(country_filter)}" if country_filter else " countries=all"
             self.report.log_api(
                 "GSC",
                 label,
                 detail=(
                     f"site={self.site_url} date={date_value.isoformat()} "
-                    f"dimensions={dimensions} rows={len(rows_out)} limit={row_limit}"
+                    f"dimensions={dimensions} rows={len(rows_out)} limit={row_limit}{country_note}"
                 ),
             )
         return rows_out
@@ -2435,6 +2479,7 @@ def sync_gsc_top_queries(
             ["query", "country"],
             row_limit=config.gsc_top_queries_limit,
             label="searchAnalytics/query (top queries)",
+            country_filter=site.gsc_top_countries,
         )
         api_total += len(api_rows)
 
@@ -2445,6 +2490,8 @@ def sync_gsc_top_queries(
             keyword = str(keys[0]).strip()
             country_code = str(keys[1]).strip().lower()
             if not keyword:
+                continue
+            if not gsc_top_country_allowed(site, country_code):
                 continue
             country_option = worksheet_country_option(table, country_code)
             if not country_option:
@@ -2482,6 +2529,7 @@ def sync_gsc_top_queries(
         f"gsc top queries ({site.key})",
         detail=(
             f"range={dates[0].isoformat()}..{dates[-1].isoformat()} days={len(dates)} "
+            f"countries={gsc_top_country_scope_label(site)} "
             f"api={api_total} created={created} updated={updated} "
             f"skip_country={sum(skipped_countries.values())}"
             + (f" missing={format_skipped_countries(skipped_countries)}" if skipped_countries else "")
@@ -2491,6 +2539,7 @@ def sync_gsc_top_queries(
         "新建": created,
         "更新": updated,
         "API返回": api_total,
+        "国家范围": gsc_top_country_scope_label(site),
         "跳过国家行数": sum(skipped_countries.values()),
         "数据窗口": f"{dates[0].isoformat()}..{dates[-1].isoformat()}",
     }
@@ -2538,6 +2587,7 @@ def sync_gsc_top_pages(
             ["page", "country"],
             row_limit=config.gsc_top_pages_limit,
             label="searchAnalytics/query (top pages)",
+            country_filter=site.gsc_top_countries,
         )
         api_total += len(api_rows)
 
@@ -2548,6 +2598,8 @@ def sync_gsc_top_pages(
             page_url = str(keys[0]).strip()
             country_code = str(keys[1]).strip().lower()
             if not page_url:
+                continue
+            if not gsc_top_country_allowed(site, country_code):
                 continue
             country_option = worksheet_country_option(table, country_code)
             if not country_option:
@@ -2585,6 +2637,7 @@ def sync_gsc_top_pages(
         f"gsc top pages ({site.key})",
         detail=(
             f"range={dates[0].isoformat()}..{dates[-1].isoformat()} days={len(dates)} "
+            f"countries={gsc_top_country_scope_label(site)} "
             f"api={api_total} created={created} updated={updated} "
             f"skip_country={sum(skipped_countries.values())}"
             + (f" missing={format_skipped_countries(skipped_countries)}" if skipped_countries else "")
@@ -2594,6 +2647,7 @@ def sync_gsc_top_pages(
         "新建": created,
         "更新": updated,
         "API返回": api_total,
+        "国家范围": gsc_top_country_scope_label(site),
         "跳过国家行数": sum(skipped_countries.values()),
         "数据窗口": f"{dates[0].isoformat()}..{dates[-1].isoformat()}",
     }
