@@ -2,7 +2,7 @@
 SEO sync: pull GSC + Ahrefs and write to Mingdao worksheets.
 
 Run via run_sync.bat (about once per week).
-Writes: SEO 自动数据看板、站点关键词库、页面管理表、外链监控表。
+Writes: SEO 自动数据看板、站点关键词库、页面管理表、外链监控表、GSC Top 查询/页面明细。
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,8 @@ DASHBOARD_LABEL = "SEO自动数据看板"
 KEYWORDS_LABEL = "站点关键词库"
 PAGES_LABEL = "页面管理表"
 BACKLINKS_LABEL = "外链监控表"
+GSC_TOP_QUERIES_LABEL = "GSC Top 查询明细"
+GSC_TOP_PAGES_LABEL = "GSC Top 页面明细"
 
 
 @dataclass
@@ -217,12 +220,17 @@ class SyncReport:
             modules.append("页面")
         if tables.backlinks:
             modules.append("外链")
+        if tables.gsc_top_queries:
+            modules.append("GSC查询")
+        if tables.gsc_top_pages:
+            modules.append("GSC页面")
         module_text = "、".join(modules) if modules else "(无)"
 
         dash_create, dash_update = self._write_count_for_table(DASHBOARD_LABEL)
         expected_dash = (
             len(self.config.sites) * self.config.dashboard_sync_days if tables.dashboard else 0
         )
+        gsc_top_enabled = tables.gsc_top_queries or tables.gsc_top_pages
 
         lines = [
             "",
@@ -232,11 +240,23 @@ class SyncReport:
             f"Duration      : {elapsed:.0f}s",
             f"Sync modules  : {module_text}",
             f"Anchor date   : {self.data_date.isoformat()}",
-            f"Dashboard win : {self.config.dashboard_sync_days} days ending on anchor",
+        ]
+        if tables.dashboard:
+            lines.append(
+                f"Dashboard win : {self.config.dashboard_sync_days} days ending on anchor"
+            )
+        if gsc_top_enabled:
+            lines.append(
+                f"GSC Top win   : {self.config.dashboard_sync_days} days ending on anchor "
+                f"(查询/页面各写锚点−{self.config.dashboard_sync_days - 1} … 锚点)"
+            )
+        lines.extend(
+            [
             f"Mingdao writes: {len(self.writes)} total (create {dash_create}, update {dash_update} on 看板)",
             f"Warnings      : {len(self.warnings)}",
             f"API failures  : {api_fail}",
-        ]
+            ]
+        )
         if tables.dashboard and expected_dash:
             lines.append(f"Dashboard rows: {dash_create + dash_update} written / {expected_dash} expected")
 
@@ -261,15 +281,25 @@ class SyncReport:
         finished_at = dt.datetime.now()
         report_path = REPORT_DIR / f"sync-report-{self.started_at.strftime('%Y%m%d-%H%M%S')}.txt"
         summary_lines = self.render_summary(finished_at)
-        lines = [
+        tables = self.tables or SyncTables()
+        gsc_top_enabled = tables.gsc_top_queries or tables.gsc_top_pages
+        header_lines = [
             "SEO Mingdao Sync Report",
             "=" * 60,
             f"Started : {self.started_at.isoformat(sep=' ', timespec='seconds')}",
             f"Finished: {finished_at.isoformat(sep=' ', timespec='seconds')}",
             f"Anchor date : {self.data_date.isoformat()}",
-            f"Dashboard   : {self.config.dashboard_sync_days} days ending on anchor",
-            f"Sites     : {', '.join(site.key for site in self.config.sites)}",
         ]
+        if tables.dashboard:
+            header_lines.append(
+                f"Dashboard   : {self.config.dashboard_sync_days} days ending on anchor"
+            )
+        if gsc_top_enabled:
+            header_lines.append(
+                f"GSC Top     : {self.config.dashboard_sync_days} days ending on anchor"
+            )
+        header_lines.append(f"Sites     : {', '.join(site.key for site in self.config.sites)}")
+        lines = header_lines
         lines.extend(summary_lines)
         lines.extend(
             [
@@ -391,6 +421,8 @@ class WorksheetsConfig:
     keywords: WorksheetTableConfig
     pages: WorksheetTableConfig
     backlinks: WorksheetTableConfig
+    gsc_top_queries: WorksheetTableConfig
+    gsc_top_pages: WorksheetTableConfig
 
 
 @dataclass
@@ -408,10 +440,17 @@ class SyncTables:
     pages: bool = True
     backlinks: bool = True
     dashboard: bool = True
+    gsc_top_queries: bool = True
+    gsc_top_pages: bool = True
 
 
 def sync_needs_gsc(tables: SyncTables) -> bool:
-    return tables.pages or tables.dashboard
+    return (
+        tables.pages
+        or tables.dashboard
+        or tables.gsc_top_queries
+        or tables.gsc_top_pages
+    )
 
 
 @dataclass(frozen=True)
@@ -441,6 +480,8 @@ class Config:
     cache_enabled: bool
     cache_ttl_hours: int
     gsc_recent_refresh_days: int
+    gsc_top_queries_limit: int
+    gsc_top_pages_limit: int
 
     @classmethod
     def load(cls, *, site_filter: list[str] | None = None) -> "Config":
@@ -507,6 +548,8 @@ class Config:
             cache_enabled=os.getenv("CACHE_ENABLED", "1").lower() not in {"0", "false", "no", "off"},
             cache_ttl_hours=int(os.getenv("CACHE_TTL_HOURS", "12")),
             gsc_recent_refresh_days=int(os.getenv("GSC_RECENT_REFRESH_DAYS", "2")),
+            gsc_top_queries_limit=int(os.getenv("GSC_TOP_QUERIES_LIMIT", "1000")),
+            gsc_top_pages_limit=int(os.getenv("GSC_TOP_PAGES_LIMIT", "1000")),
         )
 
     def site_option_key(self, site_key: str) -> str:
@@ -543,7 +586,12 @@ def load_mingdao_options() -> dict[str, dict[str, str]]:
 
 def load_worksheet_table(raw: dict[str, Any]) -> WorksheetTableConfig:
     option_keys: dict[str, dict[str, str]] = {}
-    for key in ("index_status_option_keys", "dofollow_option_keys", "link_status_option_keys"):
+    for key in (
+        "index_status_option_keys",
+        "dofollow_option_keys",
+        "link_status_option_keys",
+        "country_option_keys",
+    ):
         if key in raw:
             option_keys[key.removesuffix("_option_keys")] = dict(raw[key])
     return WorksheetTableConfig(
@@ -559,16 +607,55 @@ KEYWORD_FIELD_ENV_KEYS: dict[str, str] = {
     "value_score": "MINGDAO_FIELD_KEYWORD_VALUE_SCORE",
 }
 
+GSC_TOP_QUERIES_FIELD_ENV_KEYS: dict[str, str] = {
+    "data_date": "MINGDAO_FIELD_GSC_QUERY_DATA_DATE",
+    "site": "MINGDAO_FIELD_GSC_QUERY_SITE",
+    "keyword": "MINGDAO_FIELD_GSC_QUERY_KEYWORD",
+    "country": "MINGDAO_FIELD_GSC_QUERY_COUNTRY",
+    "clicks": "MINGDAO_FIELD_GSC_QUERY_CLICKS",
+    "impressions": "MINGDAO_FIELD_GSC_QUERY_IMPRESSIONS",
+    "ctr": "MINGDAO_FIELD_GSC_QUERY_CTR",
+    "position": "MINGDAO_FIELD_GSC_QUERY_POSITION",
+}
+
+GSC_TOP_PAGES_FIELD_ENV_KEYS: dict[str, str] = {
+    "data_date": "MINGDAO_FIELD_GSC_PAGE_DATA_DATE",
+    "site": "MINGDAO_FIELD_GSC_PAGE_SITE",
+    "country": "MINGDAO_FIELD_GSC_PAGE_COUNTRY",
+    "page_url": "MINGDAO_FIELD_GSC_PAGE_URL",
+    "clicks": "MINGDAO_FIELD_GSC_PAGE_CLICKS",
+    "impressions": "MINGDAO_FIELD_GSC_PAGE_IMPRESSIONS",
+    "ctr": "MINGDAO_FIELD_GSC_PAGE_CTR",
+    "position": "MINGDAO_FIELD_GSC_PAGE_POSITION",
+}
+
+
+def apply_field_env_overrides(fields: dict[str, str], env_keys: dict[str, str]) -> dict[str, str]:
+    merged = dict(fields)
+    for logical, env_key in env_keys.items():
+        value = os.getenv(env_key, "").strip()
+        if value:
+            merged[logical] = value
+    return merged
+
 
 def apply_keyword_field_env_overrides(fields: dict[str, str]) -> dict[str, str]:
     """关键词表可选列：.env 覆盖 mingdao_worksheets.json（与看板 MINGDAO_FIELD_DASH_* 一致）。"""
-    merged = dict(fields)
-    for logical, env_key in KEYWORD_FIELD_ENV_KEYS.items():
-        value = os.getenv(env_key, "").strip()
-        if not value and logical == "cpc":
-            value = os.getenv("CPC", "").strip()
-        if value:
-            merged[logical] = value
+    merged = apply_field_env_overrides(fields, KEYWORD_FIELD_ENV_KEYS)
+    cpc = os.getenv("CPC", "").strip()
+    if cpc and "cpc" not in KEYWORD_FIELD_ENV_KEYS:
+        merged["cpc"] = cpc
+    if cpc and not os.getenv("MINGDAO_FIELD_KEYWORD_CPC", "").strip():
+        merged["cpc"] = cpc
+    return merged
+
+
+def apply_worksheet_env_overrides(raw: dict[str, Any], *, worksheet_env: str, field_env: dict[str, str]) -> dict[str, Any]:
+    merged = dict(raw)
+    worksheet_id = os.getenv(worksheet_env, "").strip()
+    if worksheet_id:
+        merged["worksheet_id"] = worksheet_id
+    merged["fields"] = apply_field_env_overrides(dict(merged["fields"]), field_env)
     return merged
 
 
@@ -578,10 +665,22 @@ def load_worksheets_config() -> WorksheetsConfig:
     payload = json.loads(WORKSHEETS_FILE.read_text(encoding="utf-8"))
     keywords_raw = dict(payload["keywords"])
     keywords_raw["fields"] = apply_keyword_field_env_overrides(dict(keywords_raw["fields"]))
+    gsc_queries_raw = apply_worksheet_env_overrides(
+        payload["gsc_top_queries"],
+        worksheet_env="MINGDAO_WORKSHEET_GSC_TOP_QUERIES",
+        field_env=GSC_TOP_QUERIES_FIELD_ENV_KEYS,
+    )
+    gsc_pages_raw = apply_worksheet_env_overrides(
+        payload["gsc_top_pages"],
+        worksheet_env="MINGDAO_WORKSHEET_GSC_TOP_PAGES",
+        field_env=GSC_TOP_PAGES_FIELD_ENV_KEYS,
+    )
     return WorksheetsConfig(
         keywords=load_worksheet_table(keywords_raw),
         pages=load_worksheet_table(payload["pages"]),
         backlinks=load_worksheet_table(payload["backlinks"]),
+        gsc_top_queries=load_worksheet_table(gsc_queries_raw),
+        gsc_top_pages=load_worksheet_table(gsc_pages_raw),
     )
 
 
@@ -1389,6 +1488,60 @@ class GSCClient:
             )
         return clicks
 
+    def query_dimension_rows(
+        self,
+        date_value: dt.date,
+        dimensions: list[str],
+        *,
+        row_limit: int = 1000,
+        label: str = "searchAnalytics/query",
+    ) -> list[dict[str, Any]]:
+        """按 dimensions 拉 Top 行（默认按点击降序），支持分页至 row_limit。"""
+        rows_out: list[dict[str, Any]] = []
+        start_row = 0
+        batch_size = min(25000, max(1, row_limit))
+
+        while len(rows_out) < row_limit:
+            body = {
+                "startDate": date_value.isoformat(),
+                "endDate": date_value.isoformat(),
+                "dimensions": dimensions,
+                "rowLimit": min(batch_size, row_limit - len(rows_out)),
+                "startRow": start_row,
+            }
+            result = self._query_search_analytics(body)
+            batch = result.get("rows", [])
+            if not batch:
+                break
+            for row in batch:
+                keys = row.get("keys", [])
+                if len(keys) != len(dimensions):
+                    continue
+                item = {
+                    "keys": keys,
+                    "clicks": int(row.get("clicks", 0)),
+                    "impressions": int(row.get("impressions", 0)),
+                    "ctr": float(row.get("ctr", 0)),
+                    "position": float(row.get("position", 0)),
+                }
+                rows_out.append(item)
+                if len(rows_out) >= row_limit:
+                    break
+            if len(batch) < body["rowLimit"]:
+                break
+            start_row += len(batch)
+
+        if self.report:
+            self.report.log_api(
+                "GSC",
+                label,
+                detail=(
+                    f"site={self.site_url} date={date_value.isoformat()} "
+                    f"dimensions={dimensions} rows={len(rows_out)} limit={row_limit}"
+                ),
+            )
+        return rows_out
+
     def inspect_page_url(self, page_url: str) -> str:
         url = "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect"
         body = {"inspectionUrl": page_url, "siteUrl": self.site_url}
@@ -2140,6 +2293,315 @@ def sync_pages(
     return stats
 
 
+def worksheet_country_option(table: WorksheetTableConfig, country_code: str) -> str | None:
+    code = country_code.strip().lower()
+    country_keys = table.option_keys.get("country", {})
+    return country_keys.get(code)
+
+
+def invert_option_keys(option_keys: dict[str, str]) -> dict[str, str]:
+    return {value: key for key, value in option_keys.items()}
+
+
+def resolve_country_code(raw: str, country_key_to_code: dict[str, str]) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+    if text in country_key_to_code:
+        return country_key_to_code[text].lower()
+    return text.lower()
+
+
+def format_skipped_countries(skipped: Counter[str]) -> str:
+    return ", ".join(f"{code}×{count}" for code, count in sorted(skipped.items()))
+
+
+def log_missing_country_warning(
+    report: SyncReport,
+    *,
+    site_key: str,
+    table_label: str,
+    skipped: Counter[str],
+) -> None:
+    if not skipped:
+        return
+    codes = format_skipped_countries(skipped)
+    report.log_warning(
+        f"{site_key} {table_label} 缺少国家单选选项，跳过 {sum(skipped.values())} 行: {codes} "
+        f"（请在明道云建选项并写入 mingdao_worksheets.json country_option_keys）"
+    )
+
+
+def build_date_filter(control_id: str, data_date: dt.date) -> dict[str, Any]:
+    return {
+        "controlId": control_id,
+        "dataType": MingdaoClient.DATE_TYPE,
+        "spliceType": 1,
+        "filterType": 2,
+        "value": data_date.isoformat(),
+    }
+
+
+def build_gsc_metric_controls(fields: dict[str, str], row: dict[str, Any]) -> list[dict[str, str]]:
+    controls: list[dict[str, str]] = [
+        {"controlId": fields["clicks"], "value": format_mingdao_number(row["clicks"])},
+        {"controlId": fields["impressions"], "value": format_mingdao_number(row["impressions"])},
+        {"controlId": fields["ctr"], "value": format_mingdao_number(row["ctr"])},
+    ]
+    position = row.get("position")
+    if position is not None:
+        controls.append(
+            {"controlId": fields["position"], "value": format_mingdao_number(round(float(position), 1))}
+        )
+    return controls
+
+
+def build_gsc_top_query_controls(
+    table: WorksheetTableConfig,
+    *,
+    site_option_key: str,
+    data_date: dt.date,
+    keyword: str,
+    country_option_key: str,
+    metrics: dict[str, Any],
+) -> list[dict[str, str]]:
+    fields = table.fields
+    controls = [
+        {"controlId": fields["data_date"], "value": format_mingdao_date(data_date)},
+        {"controlId": fields["site"], "value": site_option_key},
+        {"controlId": fields["keyword"], "value": keyword},
+        {"controlId": fields["country"], "value": country_option_key},
+    ]
+    controls.extend(build_gsc_metric_controls(fields, metrics))
+    return controls
+
+
+def build_gsc_top_page_controls(
+    table: WorksheetTableConfig,
+    *,
+    site_option_key: str,
+    data_date: dt.date,
+    page_url: str,
+    country_option_key: str,
+    metrics: dict[str, Any],
+) -> list[dict[str, str]]:
+    fields = table.fields
+    controls = [
+        {"controlId": fields["data_date"], "value": format_mingdao_date(data_date)},
+        {"controlId": fields["site"], "value": site_option_key},
+        {"controlId": fields["page_url"], "value": page_url},
+        {"controlId": fields["country"], "value": country_option_key},
+    ]
+    controls.extend(build_gsc_metric_controls(fields, metrics))
+    return controls
+
+
+def sync_gsc_top_queries(
+    config: Config,
+    mingdao: MingdaoClient,
+    gsc: GSCClient,
+    report: SyncReport,
+    site: SiteConfig,
+    anchor: dt.date,
+) -> None:
+    table = config.worksheets.gsc_top_queries
+    site_option = worksheet_site_option(table, site.key)
+    country_key_to_code = invert_option_keys(table.option_keys.get("country", {}))
+    dates = get_dashboard_dates(config, anchor=anchor)
+
+    created = 0
+    updated = 0
+    api_total = 0
+    skipped_countries: Counter[str] = Counter()
+
+    for data_date in dates:
+        filters = [
+            build_site_filter(table.fields["site"], site_option),
+            build_date_filter(table.fields["data_date"], data_date),
+        ]
+        existing_rows = mingdao.list_all_rows(table.worksheet_id, filters=filters)
+        row_index: dict[tuple[str, str], str] = {}
+        for row in existing_rows:
+            keyword = row_control_value(row, table.fields["keyword"])
+            country_code = resolve_country_code(
+                row_control_value(row, table.fields["country"]),
+                country_key_to_code,
+            )
+            if keyword and country_code:
+                row_index[(keyword, country_code)] = row["rowid"]
+
+        api_rows = gsc.query_dimension_rows(
+            data_date,
+            ["query", "country"],
+            row_limit=config.gsc_top_queries_limit,
+            label="searchAnalytics/query (top queries)",
+        )
+        api_total += len(api_rows)
+
+        for item in api_rows:
+            keys = item.get("keys", [])
+            if len(keys) < 2:
+                continue
+            keyword = str(keys[0]).strip()
+            country_code = str(keys[1]).strip().lower()
+            if not keyword:
+                continue
+            country_option = worksheet_country_option(table, country_code)
+            if not country_option:
+                skipped_countries[country_code] += 1
+                continue
+
+            metrics = {
+                "clicks": item["clicks"],
+                "impressions": item["impressions"],
+                "ctr": item["ctr"],
+                "position": item["position"],
+            }
+            controls = build_gsc_top_query_controls(
+                table,
+                site_option_key=site_option,
+                data_date=data_date,
+                keyword=keyword,
+                country_option_key=country_option,
+                metrics=metrics,
+            )
+            lookup = (keyword, country_code)
+            row_id = row_index.get(lookup)
+            if row_id:
+                mingdao.edit_row(table.worksheet_id, row_id, controls)
+                updated += 1
+            else:
+                mingdao.add_row(table.worksheet_id, controls)
+                created += 1
+
+    log_missing_country_warning(
+        report, site_key=site.key, table_label="GSC Top 查询", skipped=skipped_countries
+    )
+    report.log_api(
+        "sync",
+        f"gsc top queries ({site.key})",
+        detail=(
+            f"range={dates[0].isoformat()}..{dates[-1].isoformat()} days={len(dates)} "
+            f"api={api_total} created={created} updated={updated} "
+            f"skip_country={sum(skipped_countries.values())}"
+            + (f" missing={format_skipped_countries(skipped_countries)}" if skipped_countries else "")
+        ),
+    )
+    write_stats: dict[str, Any] = {
+        "新建": created,
+        "更新": updated,
+        "API返回": api_total,
+        "跳过国家行数": sum(skipped_countries.values()),
+        "数据窗口": f"{dates[0].isoformat()}..{dates[-1].isoformat()}",
+    }
+    if skipped_countries:
+        write_stats["缺少国家选项"] = dict(sorted(skipped_countries.items()))
+    report.log_write(GSC_TOP_QUERIES_LABEL, "sync", site.key, write_stats)
+
+
+def sync_gsc_top_pages(
+    config: Config,
+    mingdao: MingdaoClient,
+    gsc: GSCClient,
+    report: SyncReport,
+    site: SiteConfig,
+    anchor: dt.date,
+) -> None:
+    table = config.worksheets.gsc_top_pages
+    site_option = worksheet_site_option(table, site.key)
+    country_key_to_code = invert_option_keys(table.option_keys.get("country", {}))
+    dates = get_dashboard_dates(config, anchor=anchor)
+
+    created = 0
+    updated = 0
+    api_total = 0
+    skipped_countries: Counter[str] = Counter()
+
+    for data_date in dates:
+        filters = [
+            build_site_filter(table.fields["site"], site_option),
+            build_date_filter(table.fields["data_date"], data_date),
+        ]
+        existing_rows = mingdao.list_all_rows(table.worksheet_id, filters=filters)
+        row_index: dict[tuple[str, str], str] = {}
+        for row in existing_rows:
+            page_url = row_control_value(row, table.fields["page_url"])
+            country_code = resolve_country_code(
+                row_control_value(row, table.fields["country"]),
+                country_key_to_code,
+            )
+            if page_url and country_code:
+                row_index[(normalize_page_url(page_url), country_code)] = row["rowid"]
+
+        api_rows = gsc.query_dimension_rows(
+            data_date,
+            ["page", "country"],
+            row_limit=config.gsc_top_pages_limit,
+            label="searchAnalytics/query (top pages)",
+        )
+        api_total += len(api_rows)
+
+        for item in api_rows:
+            keys = item.get("keys", [])
+            if len(keys) < 2:
+                continue
+            page_url = str(keys[0]).strip()
+            country_code = str(keys[1]).strip().lower()
+            if not page_url:
+                continue
+            country_option = worksheet_country_option(table, country_code)
+            if not country_option:
+                skipped_countries[country_code] += 1
+                continue
+
+            metrics = {
+                "clicks": item["clicks"],
+                "impressions": item["impressions"],
+                "ctr": item["ctr"],
+                "position": item["position"],
+            }
+            controls = build_gsc_top_page_controls(
+                table,
+                site_option_key=site_option,
+                data_date=data_date,
+                page_url=page_url,
+                country_option_key=country_option,
+                metrics=metrics,
+            )
+            lookup = (normalize_page_url(page_url), country_code)
+            row_id = row_index.get(lookup)
+            if row_id:
+                mingdao.edit_row(table.worksheet_id, row_id, controls)
+                updated += 1
+            else:
+                mingdao.add_row(table.worksheet_id, controls)
+                created += 1
+
+    log_missing_country_warning(
+        report, site_key=site.key, table_label="GSC Top 页面", skipped=skipped_countries
+    )
+    report.log_api(
+        "sync",
+        f"gsc top pages ({site.key})",
+        detail=(
+            f"range={dates[0].isoformat()}..{dates[-1].isoformat()} days={len(dates)} "
+            f"api={api_total} created={created} updated={updated} "
+            f"skip_country={sum(skipped_countries.values())}"
+            + (f" missing={format_skipped_countries(skipped_countries)}" if skipped_countries else "")
+        ),
+    )
+    write_stats: dict[str, Any] = {
+        "新建": created,
+        "更新": updated,
+        "API返回": api_total,
+        "跳过国家行数": sum(skipped_countries.values()),
+        "数据窗口": f"{dates[0].isoformat()}..{dates[-1].isoformat()}",
+    }
+    if skipped_countries:
+        write_stats["缺少国家选项"] = dict(sorted(skipped_countries.items()))
+    report.log_write(GSC_TOP_PAGES_LABEL, "sync", site.key, write_stats)
+
+
 def sync_backlinks(
     config: Config,
     mingdao: MingdaoClient,
@@ -2289,6 +2751,14 @@ def sync_site(
         page_stats = sync_pages(config, mingdao, gsc, report, site, anchor)
     if tables.backlinks:
         sync_backlinks(config, mingdao, ahrefs, report, site, anchor)
+    if tables.gsc_top_queries:
+        if gsc is None:
+            raise RuntimeError("GSC client required for GSC Top 查询明细")
+        sync_gsc_top_queries(config, mingdao, gsc, report, site, anchor)
+    if tables.gsc_top_pages:
+        if gsc is None:
+            raise RuntimeError("GSC client required for GSC Top 页面明细")
+        sync_gsc_top_pages(config, mingdao, gsc, report, site, anchor)
     if tables.dashboard:
         if gsc is None:
             raise RuntimeError("GSC client required for SEO 自动数据看板")
@@ -2477,6 +2947,16 @@ def parse_args() -> argparse.Namespace:
         help="Skip SEO 自动数据看板",
     )
     parser.add_argument(
+        "--skip-gsc-top-queries",
+        action="store_true",
+        help="Skip GSC Top 查询明细",
+    )
+    parser.add_argument(
+        "--skip-gsc-top-pages",
+        action="store_true",
+        help="Skip GSC Top 页面明细",
+    )
+    parser.add_argument(
         "--anchor-date",
         metavar="YYYY-MM-DD",
         help="覆盖锚点日（Ahrefs date、关键词/页面数据日期；例 2026-05-30）",
@@ -2491,6 +2971,8 @@ def main() -> None:
         pages=not args.skip_pages,
         backlinks=not args.skip_backlinks,
         dashboard=not args.skip_dashboard,
+        gsc_top_queries=not args.skip_gsc_top_queries,
+        gsc_top_pages=not args.skip_gsc_top_pages,
     )
     run_sync(
         test_mingdao_only=args.test_mingdao_only,
