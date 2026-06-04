@@ -374,6 +374,7 @@ class DashboardFieldIds:
     backlinks: str
     weekly_avg_position: str | None
     weekly_avg_clicks: str | None
+    site_dr: str | None
     indexed: str
     issues: str
     alert: str
@@ -516,6 +517,11 @@ class Config:
                 weekly_avg_clicks=(
                     os.getenv("MINGDAO_FIELD_DASH_WEEKLY_CLICKS", "").strip()
                     or os.getenv("周自然点击", "").strip()
+                    or None
+                ),
+                site_dr=(
+                    os.getenv("MINGDAO_FIELD_DASH_SITE_DR", "").strip()
+                    or os.getenv("本站DR", "").strip()
                     or None
                 ),
                 indexed=env_required("MINGDAO_FIELD_DASH_INDEXED"),
@@ -1227,6 +1233,8 @@ def build_dashboard_controls(config: Config, logical_fields: dict[str, Any], sit
         mapping["周平均排名"] = fields.weekly_avg_position
     if fields.weekly_avg_clicks:
         mapping["周自然点击"] = fields.weekly_avg_clicks
+    if fields.site_dr:
+        mapping["本站DR"] = fields.site_dr
 
     controls: list[dict[str, str]] = []
     for name, control_id in mapping.items():
@@ -1825,16 +1833,48 @@ class AhrefsClient:
         return merged, countries
 
     def get_dashboard_summary(self) -> dict[str, Any]:
-        """锚点日汇总：Backlinks 净值等（四档词数改由看板按日拉取）。"""
+        """锚点日汇总：Backlinks 净值、本站 DR 等（四档词数改由看板按日拉取）。"""
         new_rd = self._get_refdomains_delta()
-        summary: dict[str, Any] = {"new_referring_domains": new_rd}
+        site_dr = self._get_domain_rating()
+        summary: dict[str, Any] = {
+            "new_referring_domains": new_rd,
+            "site_domain_rating": site_dr,
+        }
         if self.report:
             self.report.log_api(
                 "Ahrefs",
                 "dashboard summary",
-                detail=f"site={self.site_key} date={self.report_date.isoformat()} backlinks={new_rd}",
+                detail=(
+                    f"site={self.site_key} date={self.report_date.isoformat()} "
+                    f"backlinks={new_rd} site_dr={site_dr}"
+                ),
             )
         return summary
+
+    def _get_domain_rating(self) -> float | None:
+        payload = self._request(
+            "site-explorer/domain-rating",
+            {
+                "target": self.target_domain,
+                "date": self.report_date.isoformat(),
+            },
+        )
+        dr_block = payload.get("domain_rating")
+        if isinstance(dr_block, dict):
+            raw = dr_block.get("domain_rating")
+        else:
+            raw = dr_block
+        if raw is None:
+            dr = None
+        else:
+            dr = round(float(raw), 1)
+        if self.report:
+            self.report.log_api(
+                "Ahrefs",
+                "site-explorer/domain-rating",
+                detail=f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} dr={dr}",
+            )
+        return dr
 
     def _get_refdomains_delta(self) -> int | None:
         start_date = self.report_date - dt.timedelta(days=7)
@@ -2766,6 +2806,9 @@ def sync_dashboard(
                 fields["周自然点击"] = weekly_avg_clicks
             if traffic_week_change is not None:
                 fields["周环比流量"] = round(traffic_week_change, 4)
+            site_dr = ahrefs_anchor_summary.get("site_domain_rating")
+            if site_dr is not None and config.dashboard_fields.site_dr:
+                fields["本站DR"] = site_dr
 
         if is_provisional_gsc_zero(gsc_summary, data_date, config):
             report.log_warning(
