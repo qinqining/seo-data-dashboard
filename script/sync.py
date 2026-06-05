@@ -1700,6 +1700,7 @@ class AhrefsClient:
         self.report_date = report_date or get_sync_anchor_date(config)
         self.compare_date = self.report_date - dt.timedelta(days=7)
         self._rankings_by_date: dict[str, dict[str, dict[str, Any]]] = {}
+        self._domain_rating_by_date: dict[str, float | None] = {}
 
     def load_organic_rankings(self) -> dict[str, dict[str, Any]]:
         """锚点日有机词（关键词同步等沿用）。"""
@@ -1833,12 +1834,10 @@ class AhrefsClient:
         return merged, countries
 
     def get_dashboard_summary(self) -> dict[str, Any]:
-        """锚点日汇总：Backlinks 净值、本站 DR 等（四档词数改由看板按日拉取）。"""
+        """锚点日汇总：Backlinks 净值（四档词数、本站 DR 改由看板按日拉取）。"""
         new_rd = self._get_refdomains_delta()
-        site_dr = self._get_domain_rating()
         summary: dict[str, Any] = {
             "new_referring_domains": new_rd,
-            "site_domain_rating": site_dr,
         }
         if self.report:
             self.report.log_api(
@@ -1846,17 +1845,26 @@ class AhrefsClient:
                 "dashboard summary",
                 detail=(
                     f"site={self.site_key} date={self.report_date.isoformat()} "
-                    f"backlinks={new_rd} site_dr={site_dr}"
+                    f"backlinks={new_rd}"
                 ),
             )
         return summary
 
-    def _get_domain_rating(self) -> float | None:
+    def get_domain_rating_for_date(self, report_date: dt.date) -> float | None:
+        """指定日的 Ahrefs 全站 Domain Rating（看板 7 日窗口每日各写一行）。"""
+        cache_key = report_date.isoformat()
+        if cache_key in self._domain_rating_by_date:
+            return self._domain_rating_by_date[cache_key]
+        dr = self._fetch_domain_rating(report_date)
+        self._domain_rating_by_date[cache_key] = dr
+        return dr
+
+    def _fetch_domain_rating(self, report_date: dt.date) -> float | None:
         payload = self._request(
             "site-explorer/domain-rating",
             {
                 "target": self.target_domain,
-                "date": self.report_date.isoformat(),
+                "date": report_date.isoformat(),
             },
         )
         dr_block = payload.get("domain_rating")
@@ -1872,7 +1880,10 @@ class AhrefsClient:
             self.report.log_api(
                 "Ahrefs",
                 "site-explorer/domain-rating",
-                detail=f"site={self.site_key} target={self.target_domain} date={self.report_date.isoformat()} dr={dr}",
+                detail=(
+                    f"site={self.site_key} target={self.target_domain} "
+                    f"date={report_date.isoformat()} dr={dr}"
+                ),
             )
         return dr
 
@@ -2791,6 +2802,11 @@ def sync_dashboard(
             **rank_bucket_logical_fields(rank_buckets),
         }
 
+        if config.dashboard_fields.site_dr:
+            site_dr = ahrefs.get_domain_rating_for_date(data_date)
+            if site_dr is not None:
+                fields["本站DR"] = site_dr
+
         if data_date == anchor:
             fields.update(
                 {
@@ -2806,9 +2822,6 @@ def sync_dashboard(
                 fields["周自然点击"] = weekly_avg_clicks
             if traffic_week_change is not None:
                 fields["周环比流量"] = round(traffic_week_change, 4)
-            site_dr = ahrefs_anchor_summary.get("site_domain_rating")
-            if site_dr is not None and config.dashboard_fields.site_dr:
-                fields["本站DR"] = site_dr
 
         if is_provisional_gsc_zero(gsc_summary, data_date, config):
             report.log_warning(
