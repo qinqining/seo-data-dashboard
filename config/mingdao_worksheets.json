@@ -26,9 +26,23 @@
     "fields": {
       "site": "6a1d2924aa351318ffd04de3",
       "page_url": "6a1d1e60113e1b2e9c6f5e57",
+      "ahrefs_page_type": "6a223b832d7a2837673348c4",
+      "ahrefs_first_seen": "6a1d2924aa351318ffd04de5",
+      "word_count": "6a223b832d7a2837673348c5",
+      "primary_keyword": "6a1d1e60113e1b2e9c6f5e59",
+      "primary_keyword_volume": "6a223b832d7a2837673348ce",
       "index_status": "6a1d2924aa351318ffd04de6",
-      "traffic": "6a1d2924aa351318ffd04de7",
-      "data_date": "6a1d2924aa351318ffd04de8"
+      "clicks": "6a22479a9c13c93583eea449",
+      "impressions": "6a223b832d7a2837673348c6",
+      "ctr": "6a223b832d7a2837673348c7",
+      "position": "6a223b832d7a2837673348c8",
+      "data_date": "6a1d2924aa351318ffd04de8",
+      "ur": "6a223b832d7a2837673348c9",
+      "backlinks": "6a223b832d7a2837673348ca",
+      "ref_domains": "6a223b832d7a2837673348cb",
+      "ahrefs_traffic": "6a223b832d7a2837673348cc",
+      "ahrefs_value": "6a222ff7612508336e253131",
+      "keyword_count": "6a223b832d7a2837673348cd"
     },
     "site_option_keys": {
       "cncpioneer": "40b746b1-de09-483c-97b7-af59c36b121a",
@@ -83,7 +97,10 @@
       "clicks": "6a20dc182365c8d0c2ab20fd",
       "impressions": "6a20dc182365c8d0c2ab20fe",
       "ctr": "6a20dc182365c8d0c2ab20ff",
-      "position": "6a20dc182365c8d0c2ab2100"
+      "position": "6a20dc182365c8d0c2ab2100",
+      "ahrefs_volume": "",
+      "ahrefs_kd": "",
+      "ahrefs_cpc": ""
     },
     "site_option_keys": {
       "cncpioneer": "cbf263e2-6359-43ae-98d3-03babf152737",
