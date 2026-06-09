@@ -664,6 +664,7 @@ def load_worksheet_table(raw: dict[str, Any]) -> WorksheetTableConfig:
 
 
 KEYWORD_FIELD_ENV_KEYS: dict[str, str] = {
+    "site": "MINGDAO_FIELD_KEYWORD_SITE",
     "cpc": "MINGDAO_FIELD_KEYWORD_CPC",
     "value_score": "MINGDAO_FIELD_KEYWORD_VALUE_SCORE",
 }
