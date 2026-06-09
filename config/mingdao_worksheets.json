@@ -38,8 +38,7 @@
       "position": "6a223b832d7a2837673348c8",
       "data_date": "6a1d2924aa351318ffd04de8",
       "ur": "6a223b832d7a2837673348c9",
-      "backlinks": "6a223b832d7a2837673348ca",
-      "ref_domains": "6a223b832d7a2837673348cb",
+      "global_dr": "",
       "ahrefs_traffic": "6a223b832d7a2837673348cc",
       "ahrefs_value": "6a222ff7612508336e253131",
       "keyword_count": "6a223b832d7a2837673348cd"
@@ -55,36 +54,6 @@
       "已收录": "40b746b1-de09-483c-97b7-af59c36b121a",
       "未收录": "b8b4c6ea-746a-4171-87c2-84fd29b4d617",
       "索引异常": "d6451120-f481-446b-b6be-72af2227d502"
-    }
-  },
-  "backlinks": {
-    "worksheet_id": "6a1d1eae552f90d5dd3a4f8e",
-    "fields": {
-      "site": "6a1d2be3e30907a70fa44004",
-      "source_domain": "6a1d1eae552f90d5dd3a4f8f",
-      "source_url": "6a1d1eae552f90d5dd3a4f90",
-      "target_url": "6a1d1eae552f90d5dd3a4f91",
-      "anchor": "6a1d1eae552f90d5dd3a4f92",
-      "domain_dr": "6a1d2be3e30907a70fa44005",
-      "is_dofollow": "6a1d2be3e30907a70fa44006",
-      "first_seen": "6a1d2be3e30907a70fa44007",
-      "link_status": "6a1d2be3e30907a70fa44008",
-      "data_date": "6a1d2be3e30907a70fa44009"
-    },
-    "site_option_keys": {
-      "cncpioneer": "40b746b1-de09-483c-97b7-af59c36b121a",
-      "fecision": "b8b4c6ea-746a-4171-87c2-84fd29b4d617",
-      "richconn": "d6451120-f481-446b-b6be-72af2227d502",
-      "lasermicrofab": "4242d93b-b173-4995-84b5-8a7eff260d26",
-      "drametal": "bdbf2c60-8632-4d08-8e68-7dca7f54f238"
-    },
-    "dofollow_option_keys": {
-      "是": "40b746b1-de09-483c-97b7-af59c36b121a",
-      "否": "b8b4c6ea-746a-4171-87c2-84fd29b4d617"
-    },
-    "link_status_option_keys": {
-      "有效": "40b746b1-de09-483c-97b7-af59c36b121a",
-      "已失效": "b8b4c6ea-746a-4171-87c2-84fd29b4d617"
     }
   },
   "gsc_top_queries": {
