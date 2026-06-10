@@ -335,6 +335,9 @@ class SyncReport:
             )
         header_lines.append(f"Sites     : {', '.join(site.key for site in self.config.sites)}")
         lines = header_lines
+        if self.warnings:
+            lines.extend(["", f"Warnings ({len(self.warnings)})", "-" * 60])
+            lines.extend(self.warnings)
         lines.extend(summary_lines)
         lines.extend(
             [
@@ -355,9 +358,6 @@ class SyncReport:
         lines.extend(self.writes or ["(none)"])
         lines.extend(["", f"Skipped ({len(self.skips)})", "-" * 60])
         lines.extend(self.skips or ["(none)"])
-        if self.warnings:
-            lines.extend(["", f"Warnings ({len(self.warnings)})", "-" * 60])
-            lines.extend(self.warnings)
         if self.keyword_grading_lines:
             lines.extend(
                 [
@@ -408,7 +408,6 @@ class DashboardFieldIds:
     top21_100: str
     backlinks: str
     weekly_avg_position: str | None
-    weekly_avg_clicks: str | None
     site_dr: str | None
     indexed: str
     issues: str
@@ -551,11 +550,6 @@ class Config:
                     "MINGDAO_FIELD_DASH_RD_DELTA",
                 ),
                 weekly_avg_position=os.getenv("MINGDAO_FIELD_DASH_WEEKLY_AVG_POSITION", "").strip() or None,
-                weekly_avg_clicks=(
-                    os.getenv("MINGDAO_FIELD_DASH_WEEKLY_CLICKS", "").strip()
-                    or os.getenv("周自然点击", "").strip()
-                    or None
-                ),
                 site_dr=(
                     os.getenv("MINGDAO_FIELD_DASH_SITE_DR", "").strip()
                     or os.getenv("本站DR", "").strip()
@@ -603,7 +597,7 @@ class Config:
             gsc_top_queries_enrich_countries=tuple(
                 code.lower()
                 for code in parse_country_list(
-                    os.getenv("GSC_TOP_QUERIES_ENRICH_COUNTRIES", "usa")
+                    os.getenv("GSC_TOP_QUERIES_ENRICH_COUNTRIES", "")
                 )
             ),
             gsc_top_queries_enrich_mode=os.getenv(
@@ -683,42 +677,150 @@ GSC_TOP_QUERIES_FIELD_ENV_KEYS: dict[str, str] = {
     "ahrefs_cpc": "MINGDAO_FIELD_GSC_QUERY_AHREFS_CPC",
 }
 
+# Ahrefs keywords-explorer 不支持的国家（GSC alpha-3）；enrich 跳过、不请求 overview
+GSC_ENRICH_SKIP_COUNTRIES: frozenset[str] = frozenset({"irn"})
+
+# GSC ISO 3166-1 alpha-3（小写）→ Ahrefs keywords-explorer 国家码（alpha-2）
+# 与 config/mingdao_worksheets.json → gsc_top_queries.country_option_keys 对齐；zzz 无映射
 GSC_COUNTRY_TO_AHREFS: dict[str, str] = {
-    "usa": "us",
-    "gbr": "gb",
-    "deu": "de",
-    "aus": "au",
-    "can": "ca",
-    "ind": "in",
-    "fra": "fr",
-    "ita": "it",
-    "esp": "es",
-    "nld": "nl",
-    "jpn": "jp",
-    "kor": "kr",
-    "bra": "br",
-    "mex": "mx",
-    "pol": "pl",
-    "swe": "se",
-    "che": "ch",
-    "aut": "at",
-    "bel": "be",
-    "sgp": "sg",
-    "hkg": "hk",
-    "twn": "tw",
-    "tha": "th",
-    "vnm": "vn",
-    "phl": "ph",
-    "idn": "id",
-    "mys": "my",
-    "nzl": "nz",
-    "zaf": "za",
+    "ago": "ao",
+    "alb": "al",
     "are": "ae",
-    "sau": "sa",
-    "tur": "tr",
-    "rus": "ru",
-    "ukr": "ua",
+    "arg": "ar",
+    "arm": "am",
+    "aus": "au",
+    "aut": "at",
+    "aze": "az",
+    "bgr": "bg",
+    "bhr": "bh",
+    "bfa": "bf",
+    "bgd": "bd",
+    "bel": "be",
+    "ben": "bj",
+    "bih": "ba",
+    "blr": "by",
+    "blz": "bz",
+    "bol": "bo",
+    "bra": "br",
+    "brb": "bb",
+    "brn": "bn",
+    "btn": "bt",
+    "bwa": "bw",
+    "can": "ca",
+    "che": "ch",
+    "chl": "cl",
     "chn": "cn",
+    "civ": "ci",
+    "cmr": "cm",
+    "cod": "cd",
+    "col": "co",
+    "cri": "cr",
+    "cyp": "cy",
+    "cze": "cz",
+    "deu": "de",
+    "dnk": "dk",
+    "dom": "do",
+    "dza": "dz",
+    "ecu": "ec",
+    "egy": "eg",
+    "esp": "es",
+    "eth": "et",
+    "fin": "fi",
+    "fji": "fj",
+    "fra": "fr",
+    "gbr": "gb",
+    "geo": "ge",
+    "gha": "gh",
+    "glp": "gp",
+    "gnb": "gw",
+    "grc": "gr",
+    "gtm": "gt",
+    "guy": "gy",
+    "hkg": "hk",
+    "hnd": "hn",
+    "hrv": "hr",
+    "hun": "hu",
+    "idn": "id",
+    "ind": "in",
+    "irl": "ie",
+    "irq": "iq",
+    "isr": "il",
+    "ita": "it",
+    "jam": "jm",
+    "jor": "jo",
+    "jpn": "jp",
+    "kaz": "kz",
+    "ken": "ke",
+    "khm": "kh",
+    "kna": "kn",
+    "kor": "kr",
+    "kwt": "kw",
+    "lbn": "lb",
+    "lby": "ly",
+    "lka": "lk",
+    "ltu": "lt",
+    "lux": "lu",
+    "lva": "lv",
+    "lie": "li",
+    "mar": "ma",
+    "maf": "mf",
+    "mda": "md",
+    "mdg": "mg",
+    "mdv": "mv",
+    "mex": "mx",
+    "mkd": "mk",
+    "mlt": "mt",
+    "mmr": "mm",
+    "mng": "mn",
+    "mus": "mu",
+    "mys": "my",
+    "nam": "na",
+    "nga": "ng",
+    "nic": "ni",
+    "nld": "nl",
+    "nor": "no",
+    "npl": "np",
+    "nzl": "nz",
+    "omn": "om",
+    "pak": "pk",
+    "pan": "pa",
+    "per": "pe",
+    "phl": "ph",
+    "png": "pg",
+    "pol": "pl",
+    "pri": "us",
+    "prt": "pt",
+    "pse": "ps",
+    "pry": "py",
+    "pyf": "pf",
+    "qat": "qa",
+    "rou": "ro",
+    "rus": "ru",
+    "rwa": "rw",
+    "sau": "sa",
+    "sgp": "sg",
+    "slv": "sv",
+    "srb": "rs",
+    "ssd": "ss",
+    "svk": "sk",
+    "svn": "si",
+    "swz": "sz",
+    "syr": "sy",
+    "tha": "th",
+    "tto": "tt",
+    "tun": "tn",
+    "tur": "tr",
+    "twn": "tw",
+    "tza": "tz",
+    "uga": "ug",
+    "ukr": "ua",
+    "ury": "uy",
+    "usa": "us",
+    "uzb": "uz",
+    "ven": "ve",
+    "vnm": "vn",
+    "xkk": "xk",
+    "zaf": "za",
 }
 
 GSC_TOP_QUERIES_OVERVIEW_BATCH_SIZE = 50
@@ -737,7 +839,6 @@ GSC_TOP_PAGES_FIELD_ENV_KEYS: dict[str, str] = {
 PAGES_FIELD_ENV_KEYS: dict[str, str] = {
     "site": "MINGDAO_FIELD_PAGE_SITE",
     "page_url": "MINGDAO_FIELD_PAGE_URL",
-    "ahrefs_page_type": "MINGDAO_FIELD_PAGE_AHREFS_TYPE",
     "ahrefs_first_seen": "MINGDAO_FIELD_PAGE_AHREFS_FIRST_SEEN",
     "word_count": "MINGDAO_FIELD_PAGE_WORD_COUNT",
     "primary_keyword": "MINGDAO_FIELD_PAGE_PRIMARY_KEYWORD",
@@ -759,7 +860,6 @@ PAGES_FIELD_ENV_KEYS: dict[str, str] = {
 PAGES_FIELD_CHINESE_ENV_KEYS: dict[str, str] = {
     "site": "独立站",
     "page_url": "页面 URL",
-    "ahrefs_page_type": "Ahrefs页面类型",
     "ahrefs_first_seen": "发布日期",
     "word_count": "页面字数",
     "primary_keyword": "主关键词",
@@ -1157,14 +1257,6 @@ def calc_weekly_avg_position(daily_data: dict[dt.date, dict[str, Any]]) -> float
     return round(sum(positions) / len(positions), 1)
 
 
-def calc_weekly_avg_clicks(daily_data: dict[dt.date, dict[str, Any]]) -> float | None:
-    """同步窗口内（通常 7 天）自然点击的算术平均，供看板「周自然点击」。"""
-    if not daily_data:
-        return None
-    clicks = [int(day.get("clicks") or 0) for day in daily_data.values()]
-    return round(sum(clicks) / len(clicks), 1)
-
-
 def get_dashboard_dates(config: Config, *, anchor: dt.date | None = None) -> list[dt.date]:
     anchor = anchor or get_sync_anchor_date(config)
     start = anchor - dt.timedelta(days=config.dashboard_sync_days - 1)
@@ -1533,8 +1625,6 @@ def build_dashboard_controls(config: Config, logical_fields: dict[str, Any], sit
     }
     if fields.weekly_avg_position:
         mapping["周平均排名"] = fields.weekly_avg_position
-    if fields.weekly_avg_clicks:
-        mapping["周自然点击"] = fields.weekly_avg_clicks
     if fields.site_dr:
         mapping["本站DR"] = fields.site_dr
 
@@ -2469,9 +2559,6 @@ class AhrefsClient:
         out: dict[str, Any] = {}
         top_item = resolve_page_index_entry(self._top_pages_index or {}, page_url)
         if top_item:
-            page_type = top_item.get("page_type")
-            if page_type:
-                out["ahrefs_page_type"] = str(page_type)
             if top_item.get("ur") is not None:
                 out["ur"] = round(float(top_item["ur"]), 1)
             if top_item.get("keywords") is not None:
@@ -2790,7 +2877,6 @@ def build_page_controls(
         )
 
     text_field_map = {
-        "ahrefs_page_type": lambda v: str(v),
         "primary_keyword": lambda v: str(v),
     }
     for field_key, formatter in text_field_map.items():
@@ -3552,6 +3638,7 @@ def sync_gsc_top_queries(
     created = 0
     updated = 0
     api_total = 0
+    skipped_zero_clicks = 0
     skipped_countries: Counter[str] = Counter()
 
     for data_date in dates:
@@ -3567,6 +3654,9 @@ def sync_gsc_top_queries(
         api_total += len(api_rows)
 
         for item in api_rows:
+            if int(item.get("clicks") or 0) <= 0:
+                skipped_zero_clicks += 1
+                continue
             keys = item.get("keys", [])
             if len(keys) < 2:
                 continue
@@ -3614,6 +3704,7 @@ def sync_gsc_top_queries(
             f"range={dates[0].isoformat()}..{dates[-1].isoformat()} days={len(dates)} "
             f"countries={gsc_top_country_scope_label(site)} "
             f"api={api_total} created={created} updated={updated} "
+            f"skip_zero_clicks={skipped_zero_clicks} "
             f"skip_country={sum(skipped_countries.values())}"
             + (f" missing={format_skipped_countries(skipped_countries)}" if skipped_countries else "")
         ),
@@ -3623,6 +3714,7 @@ def sync_gsc_top_queries(
         "更新": updated,
         "API返回": api_total,
         "国家范围": gsc_top_country_scope_label(site),
+        "跳过0点击": skipped_zero_clicks,
         "跳过国家行数": sum(skipped_countries.values()),
         "数据窗口": f"{dates[0].isoformat()}..{dates[-1].isoformat()}",
     }
@@ -3731,7 +3823,11 @@ def enrich_gsc_top_queries(
 
     overview_by_country: dict[str, dict[str, dict[str, Any]]] = {}
     country_keywords: dict[str, list[str]] = {}
+    skipped_enrich_countries: Counter[str] = Counter()
     for keyword, country, _clicks, _row_ids in targets:
+        if country in GSC_ENRICH_SKIP_COUNTRIES:
+            skipped_enrich_countries[country] += 1
+            continue
         ahrefs_country = gsc_country_to_ahrefs(country)
         if not ahrefs_country:
             report.log_warning(
@@ -3752,6 +3848,8 @@ def enrich_gsc_top_queries(
     enriched_rows = 0
     skipped_no_metrics = 0
     for keyword, country, total_clicks, row_ids in targets:
+        if country in GSC_ENRICH_SKIP_COUNTRIES:
+            continue
         ahrefs_country = gsc_country_to_ahrefs(country)
         if not ahrefs_country:
             continue
@@ -3788,6 +3886,12 @@ def enrich_gsc_top_queries(
             f"limit={config.gsc_top_queries_enrich_limit} "
             f"targets={len(targets)} overview_keywords={api_keywords} "
             f"rows_written={enriched_rows} skipped_no_metrics={skipped_no_metrics}"
+            + (
+                f" skip_enrich_country={sum(skipped_enrich_countries.values())}"
+                f" ({format_skipped_countries(skipped_enrich_countries)})"
+                if skipped_enrich_countries
+                else ""
+            )
         ),
     )
 
@@ -3832,6 +3936,7 @@ def sync_gsc_top_pages(
     created = 0
     updated = 0
     api_total = 0
+    skipped_zero_clicks = 0
     skipped_countries: Counter[str] = Counter()
 
     for data_date in dates:
@@ -3847,6 +3952,9 @@ def sync_gsc_top_pages(
         api_total += len(api_rows)
 
         for item in api_rows:
+            if int(item.get("clicks") or 0) <= 0:
+                skipped_zero_clicks += 1
+                continue
             keys = item.get("keys", [])
             if len(keys) < 2:
                 continue
@@ -3894,6 +4002,7 @@ def sync_gsc_top_pages(
             f"range={dates[0].isoformat()}..{dates[-1].isoformat()} days={len(dates)} "
             f"countries={gsc_top_country_scope_label(site)} "
             f"api={api_total} created={created} updated={updated} "
+            f"skip_zero_clicks={skipped_zero_clicks} "
             f"skip_country={sum(skipped_countries.values())}"
             + (f" missing={format_skipped_countries(skipped_countries)}" if skipped_countries else "")
         ),
@@ -3903,6 +4012,7 @@ def sync_gsc_top_pages(
         "更新": updated,
         "API返回": api_total,
         "国家范围": gsc_top_country_scope_label(site),
+        "跳过0点击": skipped_zero_clicks,
         "跳过国家行数": sum(skipped_countries.values()),
         "数据窗口": f"{dates[0].isoformat()}..{dates[-1].isoformat()}",
     }
@@ -3970,7 +4080,6 @@ def sync_dashboard(
     last_week_clicks = gsc.query_clicks_sum(last_week_start, last_week_end)
     traffic_week_change = calc_ratio_change(this_week_clicks, last_week_clicks)
     weekly_avg_rank = calc_weekly_avg_position(daily_data)
-    weekly_avg_clicks = calc_weekly_avg_clicks(daily_data)
 
     dates = list(daily_data.keys())
     query_by_date = load_gsc_query_rows_by_dates(
@@ -4008,8 +4117,6 @@ def sync_dashboard(
             )
             if weekly_avg_rank is not None and config.dashboard_fields.weekly_avg_position:
                 fields["周平均排名"] = weekly_avg_rank
-            if weekly_avg_clicks is not None and config.dashboard_fields.weekly_avg_clicks:
-                fields["周自然点击"] = weekly_avg_clicks
             if traffic_week_change is not None:
                 fields["周环比流量"] = round(traffic_week_change, 4)
 
