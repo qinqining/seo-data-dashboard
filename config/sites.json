@@ -4,32 +4,37 @@
       "key": "cncpioneer",
       "gsc_site_url": "https://www.cncpioneer.com/",
       "ahrefs_domain": "cncpioneer.com",
-      "homepage_url": "https://www.cncpioneer.com/"
+      "homepage_url": "https://www.cncpioneer.com/",
+      "rank_tracker_project_id": 9615393
     },
     {
       "key": "fecision",
       "gsc_site_url": "https://fecision.com/",
       "ahrefs_domain": "fecision.com",
-      "homepage_url": "https://fecision.com/"
+      "homepage_url": "https://fecision.com/",
+      "rank_tracker_project_id": 9610788
     },
     {
       "key": "richconn",
       "gsc_site_url": "sc-domain:richconn.com",
       "ahrefs_domain": "richconn.com",
-      "homepage_url": "https://richconn.com/"
+      "homepage_url": "https://richconn.com/",
+      "rank_tracker_project_id": 9625090
     },
     {
       "key": "lasermicrofab",
       "gsc_site_url": "sc-domain:lasermicrofab.com",
       "ahrefs_domain": "lasermicrofab.com",
       "homepage_url": "https://www.lasermicrofab.com/",
-      "gsc_top_countries": ["usa"]
+      "gsc_top_countries": ["usa"],
+      "rank_tracker_project_id": 9689740
     },
     {
       "key": "drametal",
       "gsc_site_url": "https://drametal.com/",
       "ahrefs_domain": "drametal.com",
-      "homepage_url": "https://drametal.com/"
+      "homepage_url": "https://drametal.com/",
+      "rank_tracker_project_id": 9798709
     }
   ]
 }

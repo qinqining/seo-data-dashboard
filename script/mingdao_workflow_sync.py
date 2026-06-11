@@ -160,8 +160,6 @@ def build_controls(logical):
         "Top10词数": FIELD["top10"],
         "Top30词数": FIELD["top30"],
         "Backlinks变化": FIELD["backlinks"],
-        "已监控URL收录数": FIELD["indexed"],
-        "已监控URL异常数": FIELD["issues"],
         "异常预警": FIELD["alert"],
         "周环比流量": FIELD["traffic_wow"],
         "周环比Top30词": FIELD["top30_wow"],
@@ -323,8 +321,6 @@ logical = {
     "Top10词数": top10,
     "Top30词数": top30,
     "Backlinks变化": rd_delta,
-    "已监控URL收录数": 0,
-    "已监控URL异常数": 0,
     "异常预警": alert,
 }
 if traffic_wow is not None:

@@ -1,5 +1,5 @@
 {
-  "_comment_sites": "仅 SEO自动数据看板 的「独立站」单选 key；关键词/页面等表 UUID 在 mingdao_worksheets.json",
+  "_comment_sites": "全工作表共用选项集「独立站 (5)」的 option key；与 mingdao_worksheets.json 各表 site_option_keys 保持一致",
   "sites": {
     "cncpioneer": "06445848-cf1b-4d3d-a63d-5da8ac85c093",
     "fecision": "386f967d-e856-4b2e-8c23-150cdf954576",
